@@ -216,10 +216,22 @@ trong cửa sổ nào"** — và mỗi thứ trong đó là một lớp lỗi c�
 ## 7. Nộp bài · Submit
 
 ```bash
-make validate    # deck hợp lệ chưa? 14 lá, cân bằng lớp, lethality band
-make qualify     # chạy conformance suite → capability radar + seed
-make submit      # đóng gói agent/ deck/ eval/ thành bundle đã seal
+make test                    # bộ test công khai — đây là conformance check của bạn
+make validate                # deck hợp lệ chưa? 14 lá, cân bằng lớp, lethality band
+make submit TEAM=<tên-đội>   # đóng gói agent/ deck/ eval/ thành bundle đã seal
 ```
+
+`make submit` **bắt buộc** có `TEAM=`. Bundle nằm ở `submissions/<tên-đội>.bundle`.
+
+*`make submit` requires `TEAM=`. The sealed bundle lands in
+`submissions/<team>.bundle`. `agent/` and `deck/` lock at session start;
+`eval/` you keep working on.*
+
+> `make qualify` đã bị bỏ. Nó gọi một `qualify.py` chưa từng được viết, ghi ra
+> `submissions/radar.json` mà **không có gì đọc**. Dùng `make test`.
+>
+> *`make qualify` is retired — it called a `qualify.py` that was never written,
+> producing a file nothing reads. `make test` is the conformance check.*
 
 `make qualify` cho bạn **bốn trục độc lập** — Defence, Attack, Prosecution, Integrated — chấm trên
 **cùng một bộ fixture** cho mọi đội. Đó mới là thứ đo được năng lực từng phần; bảng đấu đo cả hệ

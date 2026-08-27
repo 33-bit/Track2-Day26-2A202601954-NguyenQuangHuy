@@ -1,6 +1,28 @@
 # RULES.md — the submission contract
 ### Vi phạm là loại bài, không phải trừ điểm. *A violation is disqualification, not a deduction.*
 
+
+> ### `CONTRACTS.md` không có trong kit — và đó là cố ý
+>
+> Rất nhiều file ở đây trích dẫn `CONTRACTS.md §x.y`. Đó là bản đặc tả của
+> giảng viên: nó chứa **đúng cái mà trọng tài chấm bạn dựa vào**. Phát nó ra là
+> phát luôn đáp án.
+>
+> Bạn **không thiếu gì cả**. Mọi thứ cần để làm bài đều có trong kit, ở dạng
+> chạy được: shape của `Decision`/`ToolCall` nằm trong `agent/gateway.py` và
+> `kit/mcp/types.py`; schema của claim và cú pháp bằng chứng nằm trong
+> `RULES.md` + `eval/prosecute.py`; đủ 17 lớp lỗi và trọng số nằm trong
+> `README.md` §5 và trong rubric chạy được ở `eval/prosecute.py`.
+>
+> Khi thấy `CONTRACTS.md §x.y`, hãy đọc nó như một số hiệu điều khoản — không
+> phải một file bạn cần đi tìm.
+>
+> *`CONTRACTS.md` is the instructor's spec and is deliberately not shipped: it is
+> the oracle the referee scores against. You are not missing anything — every
+> shape, schema, class and weight you need is in the kit in executable form.
+> Read a `CONTRACTS.md §x.y` citation as a clause number, not as a file to hunt
+> for.*
+
 ---
 
 ## 1. What you own, and what you must not touch

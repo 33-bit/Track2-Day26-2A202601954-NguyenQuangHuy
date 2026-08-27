@@ -46,11 +46,21 @@ validate-bots:
 			--world $(dir $(WORLD)) 2>&1 | tail -1; \
 	done
 
+# `qualify` used to run a `qualify.py` that was never written, writing a
+# `submissions/radar.json` that NOTHING in either repo reads. It is not a
+# missing dependency, it is a promise that was never wired up. The student's
+# real conformance check is the public suite: `make test`.
 qualify:
-	$(BIN)/python qualify.py --out submissions/radar.json
+	@echo "make qualify: retired — nothing consumed submissions/radar.json."
+	@echo "Your conformance check is 'make test' (the public suite)."
+	@echo "Then: make validate && make submit TEAM=<your-team>"
+	@exit 1
 
-submit: validate qualify
-	$(BIN)/python -m kit.submit
+# NOT `validate qualify` — qualify is retired (above), and kit.submit REQUIRES
+# --team, which this target never passed, so `make submit` failed twice over.
+submit: validate
+	@test -n "$(TEAM)" || (echo "usage: make submit TEAM=<your-team-name>" && exit 1)
+	$(BIN)/python -m kit.submit --team $(TEAM)
 
 test: check-no-key
 	$(BIN)/python -m pytest tests/
