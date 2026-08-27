@@ -606,7 +606,7 @@ function render(nowMs) {
 
   // -- stage: round banner + two agent sprites --
   roundBanner(ctx, LAYOUT.roundBanner, {
-    round: matchState.round || 1, totalRounds: 10, scale: matchState.roundScale || 1,
+    round: matchState.round || 1, totalRounds: 5, scale: matchState.roundScale || 1,
   }, nowMs);
   drawSpritePanel(LAYOUT.spriteA, SPRITES ? SPRITES.agentA : null, YOU, nowMs);
   drawSpritePanel(LAYOUT.spriteB, SPRITES ? SPRITES.agentB : null, OPPONENT, nowMs);

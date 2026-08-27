@@ -117,8 +117,13 @@ def _synthetic_deck() -> dict:
 
 
 def _synthetic_lineup(deck: dict) -> dict:
+    """A legal lineup: one card per round, taken from the deck's attack cards.
+
+    This used to be *every* attack card, which was legal only because the deck
+    happened to hold exactly one attack per round. At 5 rounds the lineup is a
+    selection (5 of 10), so take the first ROUNDS_PER_DUEL rather than all."""
     attack_ids = [c["id"] for c in deck["cards"] if c["kind"] == "attack"]
-    return {"order": attack_ids}
+    return {"order": attack_ids[:vd.ROUNDS_PER_DUEL]}
 
 
 def test_synthetic_minimal_deck_is_structurally_legal(fixture_world):

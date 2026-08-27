@@ -623,7 +623,7 @@ export function roundBanner(ctx, rect, state, t) {
   const s = state || {};
   const T = num(t, 0);
   const round = Math.max(1, Math.round(num(s.round, 1)));
-  const total = Math.max(1, Math.round(num(s.totalRounds, 10)));
+  const total = Math.max(1, Math.round(num(s.totalRounds, 5)));
   const scale = num(s.scale, 1);
 
   let alpha = 1;

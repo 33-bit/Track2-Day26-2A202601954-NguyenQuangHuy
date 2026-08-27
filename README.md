@@ -99,9 +99,42 @@ stage 5 shows what that cost. Columns 2 and 5 are the two you are actually score
 
 ```bash
 make install          # python 3.12, zero third-party deps
+make doctor           # kiểm tra sẵn sàng · readiness check
 make spar BOT=rookie  # đấu với bot dễ nhất · fight the easiest bot
 make ui               # mở màn hình pixel · open the pixel battle view
 ```
+
+### ⚠️ Thế giới (corpus) KHÔNG nằm trong repo này · The world is NOT in this repo
+
+`make doctor` sẽ báo lỗi này ở lần chạy đầu, và đó là **bình thường**:
+
+```
+no world in kit/world/ - ask your instructor for the world artifact
+```
+
+Corpus (~12 MB) do giảng viên phát riêng, không commit vào repo. Nhận được rồi,
+giải nén nguyên thư mục `<world_id>/` vào `kit/world/`:
+
+```bash
+unzip colosseum-world-<world_id>.zip -d kit/world/
+make doctor     # -> world <world_id> - N pages
+```
+
+Thư mục phải trông như `kit/world/<world_id>/manifest.json`. Nếu `make doctor`
+vẫn báo thiếu, bạn giải nén lồng sai một cấp.
+
+*The corpus (~12 MB) ships separately from your instructor — it is deliberately
+not committed. Unzip the whole `<world_id>/` directory into `kit/world/` so that
+`kit/world/<world_id>/manifest.json` exists, then re-run `make doctor`. If it
+still reports a missing world, you have one directory level too many.*
+
+> Bộ world của sinh viên **không bao giờ chứa `truth.json`** — `make doctor` sẽ
+> từ chối chạy nếu thấy nó. Nếu file đó có trong bản bạn nhận được, báo giảng
+> viên ngay: bạn đang cầm bản của giám khảo.
+>
+> *A student world never contains `truth.json`, and `make doctor` refuses to run
+> if it finds one. If yours has it, tell your instructor — you have the
+> referee's copy.*
 
 **Không cần API key.** `spar.py` chạy hoàn toàn trên `MockBroker`. Bộ kit này **không chứa HTTP
 client nào có thể gọi tới model endpoint** — đó là một tính chất công bằng, không phải chỉ là vệ

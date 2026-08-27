@@ -210,8 +210,8 @@ except ImportError as _exc:  # pragma: no cover - exercised only if kit/world/an
 # FINAL-PLAN.md §3: "credits (100 per duel side, across all 10 rounds)". No shared
 # module exports this as a constant (kit/mcp/specs.py exports ROUNDS_PER_DUEL=10 but
 # not the credit total), so it is declared here, sourced to the plan text.
-CREDITS_PER_DUEL = 100
-ROUNDS_PER_DUEL = 10
+CREDITS_PER_DUEL = 50
+ROUNDS_PER_DUEL = 5
 
 # CONTRACTS.md §6.4's `wasteful` bullet: "credits spent > the round allowance". A
 # flat 100/10=10 would brand FINAL-PLAN §4.3's own gold-standard "disciplined round"

@@ -84,7 +84,7 @@ if str(_REPO_ROOT) not in sys.path:
 from kit.world.anchor import Anchor, AnchorSyntaxError  # noqa: E402
 from kit.world.loader import World  # noqa: E402
 from kit.mcp import a2a as mcp_a2a  # noqa: E402
-from kit.mcp.specs import A2A_PEERS, MCP_SERVERS  # noqa: E402
+from kit.mcp.specs import A2A_PEERS, MCP_SERVERS, ROUNDS_PER_DUEL  # noqa: E402
 
 __all__ = [
     "MUTATION_OPS",
@@ -128,7 +128,10 @@ _MIN_DISTINCT_CLASSES = 6
 _N_ATTACKS = 10
 _N_BLANKS = 4
 _N_CARDS = _N_ATTACKS + _N_BLANKS
-_LINEUP_SIZE = 10
+# The lineup is one card per round, so this FOLLOWS the duel length rather than
+# restating it. At 10 rounds the lineup was all 10 attack cards and the only
+# choice was ORDER; at 5 it is a genuine selection (5 of 10) as well.
+_LINEUP_SIZE = ROUNDS_PER_DUEL
 
 # CONTRACTS.md section 7: which ask fields are Anchor-shaped, per ask type, and whether each
 # is an ASK INPUT (validated here) vs. only an ANSWER field (validated by the referee against

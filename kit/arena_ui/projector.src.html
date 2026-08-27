@@ -601,7 +601,7 @@ function diffPresentation(before, after, now) {
     }
   }
   if (after.round !== before.round && after.round > 0) {
-    presentation.roundBanner = { round: after.round, totalRounds: 10, scale: after.roundScale, startedAt: now };
+    presentation.roundBanner = { round: after.round, totalRounds: 5, scale: after.roundScale, startedAt: now };
   }
 }
 
@@ -962,7 +962,7 @@ function drawFeaturedPane(ctx, rect, t) {
 
   // Persistent HUD strip (no `startedAt` -> widgets.roundBanner draws fully
   // opaque and always-on, per its own doc comment).
-  widgets.roundBanner(ctx, { x: rect.x + pad, y, w: rect.w - pad * 2, h: 26 }, { round: duelMatchState.round || 1, totalRounds: 10, scale: duelMatchState.roundScale || 1 }, t);
+  widgets.roundBanner(ctx, { x: rect.x + pad, y, w: rect.w - pad * 2, h: 26 }, { round: duelMatchState.round || 1, totalRounds: 5, scale: duelMatchState.roundScale || 1 }, t);
   y += 26 + 8;
 
   const combatLogH = clamp(Math.floor(rect.h * 0.22), 90, 160);

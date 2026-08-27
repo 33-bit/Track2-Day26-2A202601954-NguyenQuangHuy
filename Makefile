@@ -2,18 +2,29 @@ PY := python3.12
 VENV := .venv
 BIN := $(VENV)/bin
 BOT ?= rookie
-AS ?= all
+# `AS` is a GNU make BUILT-IN (the assembler, default `as`), so `AS ?= all`
+# never fired and a plain `make spar BOT=rookie` ran `spar.py --as as`, which
+# argparse rejects. `?=` only assigns when a variable is UNDEFINED, and make had
+# already defined this one. Keep the documented `AS=defender` interface working
+# by honouring AS only when it really came from the command line.
+ROLE ?= all
+ifeq ($(origin AS),command line)
+ROLE := $(AS)
+endif
 
 .PHONY: install spar ui validate qualify submit test clean check-no-key
 
 install:
-	uv venv --python 3.12 $(VENV) || $(PY) -m venv $(VENV)
+	# --seed is REQUIRED: `uv venv` alone creates a venv with no pip, so the very
+	# next line died with "No module named pip" on a fresh clone. The stdlib
+	# fallback seeds pip on its own.
+	uv venv --python 3.12 --seed $(VENV) || $(PY) -m venv $(VENV)
 	$(BIN)/python -m pip install -q --upgrade pip
 	$(BIN)/python -m pip install -q pytest
 	@echo "ready. no api key needed, ever."
 
 spar:
-	$(BIN)/python spar.py --bot $(BOT) --as $(AS)
+	$(BIN)/python spar.py --bot $(BOT) --as $(ROLE)
 
 ui:
 	$(BIN)/python -m kit.arena_ui.build_ui
