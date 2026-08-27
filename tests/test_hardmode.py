@@ -31,7 +31,7 @@ from kit.mcp.hardmode import (
     HardMode,
     _seeded_int,
 )
-from kit.mcp.specs import ROUNDS_PER_DUEL, TOOL_SPECS, cost as spec_cost
+from kit.mcp.specs import TOOL_SPECS, cost as spec_cost
 from kit.mcp.types import ToolCall, ToolResult
 
 # ---------------------------------------------------------------------------
@@ -465,9 +465,7 @@ def test_list_servers_allows_exactly_one_per_duel() -> None:
     call = _call("registry", "list_servers")
     hm.begin_round(1)
     assert hm.check_before(call) is None
-    # A different round, still the same duel. Pinned to the LAST round rather
-    # than a literal, so this keeps testing 'once per duel' at any duel length.
-    hm.begin_round(ROUNDS_PER_DUEL)
+    hm.begin_round(7)  # a totally different round — still the same duel
     assert hm.check_before(call) == {"code": "rate_limited"}
 
 
@@ -476,7 +474,7 @@ def test_a_tool_with_no_rate_limit_is_never_blocked() -> None:
     hm.reset("duel-rate-4")
     assert TOOL_SPECS[("glossary", "define")].rate_limit is None
     call = _call("glossary", "define", args={"term": "field-mask", "lang": "vi"})
-    for round_no in range(1, ROUNDS_PER_DUEL + 1):
+    for round_no in range(1, 11):
         hm.begin_round(round_no)
         for _ in range(5):
             assert hm.check_before(call) is None

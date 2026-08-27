@@ -71,7 +71,7 @@ __all__ = [
 
 # CONTRACTS.md section 0 / FINAL-PLAN.md section 3: a duel is exactly 10
 # simultaneous rounds, always — never a variable "match length".
-ROUNDS_PER_DUEL = 5
+ROUNDS_PER_DUEL = 10
 
 # CONTRACTS.md section 4.1: a Command's headers arrive with "already
 # lowercased keys". Writes need both of these (FINAL-PLAN.md section 4.2,

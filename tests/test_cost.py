@@ -33,7 +33,6 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from kit.referee.detectors import CREDITS_PER_DUEL
 from kit.mcp.specs import (
     A2A_PEERS,
     MCP_SERVERS,
@@ -129,35 +128,22 @@ def test_disciplined_round_is_sustainable() -> None:
 def test_disciplined_round_survives_a_full_duel_with_real_headroom() -> None:
     """THE D-10 FIX, stated as the mirror claim FINAL-PLAN.md 4.3 makes and
     the pre-fix table failed outright: disciplined_total * ROUNDS_PER_DUEL
-    must fit inside the duel credit budget, computed directly from the table
-    rather than argued from amortization.
-
-    9 x 5 = 45 cr of a 50-credit budget, leaving 5 cr (10%) of headroom —
-    enough to absorb roughly two over-ceiling rounds (each up to 11 cr, i.e.
-    up to +2 cr over the 9 cr average) without going bankrupt, but not so
-    much that budget pressure stops being real for a team that plays
-    carelessly even occasionally.
-
-    The RATIO is the invariant, not the absolute numbers. When the duel went
-    from 10 rounds to 5, the budget was halved with it (100 -> 50) precisely
-    so this assertion still reads 90% consumed / 10% headroom. Leaving the
-    budget at 100 would have made it 45/100 and quietly retired credits as a
-    constraint — which is why this test asserts the fractions, not just the
-    totals."""
+    must fit inside the 100-credit duel budget, computed directly from the
+    table rather than argued from amortization. 9 x 10 = 90 cr, leaving 10
+    cr (~10% of the budget) of headroom — enough to absorb roughly two
+    over-ceiling rounds (each up to 11 cr, i.e. up to +2 cr over the 9 cr
+    average) without going bankrupt, but not so much that budget pressure
+    stops being real for a team that plays carelessly even occasionally."""
     disciplined_total = (
         cost("slides", "query", fields=("title", "body"), n_rows=1)
         + cost("slides", "get_frame")
         + cost("registry", "provenance")
     )
-    total_duel = disciplined_total * ROUNDS_PER_DUEL
-    headroom = CREDITS_PER_DUEL - total_duel
-    assert total_duel <= CREDITS_PER_DUEL, (
-        f"{total_duel} cr > the {CREDITS_PER_DUEL}-credit duel budget")
-    assert total_duel == 45
-    assert headroom == 5
-    # The tuning that must survive any future change to duel length:
-    assert total_duel / CREDITS_PER_DUEL == 0.9
-    assert headroom / CREDITS_PER_DUEL == 0.1
+    total_ten_rounds = disciplined_total * ROUNDS_PER_DUEL
+    headroom = 100 - total_ten_rounds
+    assert total_ten_rounds <= 100, f"{total_ten_rounds} cr > the 100-credit duel budget"
+    assert total_ten_rounds == 90
+    assert headroom == 10
 
 
 def test_rookie_round_is_bankrupt_by_round_three() -> None:

@@ -324,7 +324,7 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bot", choices=BOTS, default="rookie")
     ap.add_argument("--as", dest="role", choices=ROLES, default="all")
-    ap.add_argument("--rounds", type=int, default=5)
+    ap.add_argument("--rounds", type=int, default=10)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--ui", action="store_true", help="write a run log and print the UI url")
     ap.add_argument("--quiet", action="store_true")
