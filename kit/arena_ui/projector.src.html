@@ -1,0 +1,1129 @@
+<!doctype html>
+<!--
+  kit/arena_ui/projector.src.html — ProjectorView, the tournament second
+  screen (CONTRACTS.md section 10, FINAL-PLAN.md section 8.3). Served
+  byte-for-byte at GET / by whatever answers CONTRACTS 10.1's wire contract
+  (the collaborator's arena.event_server, or projector/run_projector.py's
+  own static-replay fallback in Day26-Colosseum-Agent-Arena).
+
+  Three panes on one <canvas>, per FINAL-PLAN 8.3 / the task brief:
+    1. THE BRACKET (left)   — two table standings + the knockout tree.
+    2. THE FEATURED DUEL (centre, largest) — the full spar-style fight,
+       built from the SAME core/widgets.js widgets spar.html uses.
+    3. THE TICKER (bottom)  — one scrolling line per live duel.
+
+  CONTRACTS.md section 10 is explicit that "one component, two modes" is
+  overstated: only core/ (decode, reduce, sprites, font, widgets, theme) is
+  shared, byte-identical between repos. This file is ProjectorView's own
+  composition of that shared core — it is not spar.html with a flag.
+
+  Vanilla JS, native ES modules, zero build step, zero CDN, zero external
+  font (workspace hard rule 1: "the arena must run with the wifi down") —
+  every <script> below is `type="module"` importing a RELATIVE path under
+  ./core/, resolved by the browser's own module loader against whatever
+  server this file is served from. No bundler ever touches this file.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>COLOSSEUM — Projector</title>
+<!-- Empty data: favicon -- suppresses the browser's automatic GET
+     /favicon.ico (a 404 against every server in this project, real or
+     fallback) without adding a binary asset or an off-host request. -->
+<link rel="icon" href="data:,">
+<style>
+  /* Minimal reset. The canvas owns all real layout; this just keeps the
+     page from flashing white before the first frame paints, and stops the
+     browser chrome from ever showing a scrollbar on a fullscreen kiosk. */
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #0a0e16; }
+  canvas { display: block; }
+  noscript {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    background: #0a0e16; color: #e7ecf7; font: bold 20px ui-monospace, Menlo, Consolas, monospace;
+    text-align: center; padding: 24px;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<noscript>COLOSSEUM — Projector needs JavaScript enabled to render the pixel arena.</noscript>
+
+<script type="module">
+import * as theme from './core/theme.js';
+import * as decode from './core/decode.js';
+import * as reduce from './core/reduce.js';
+import * as sprites from './core/sprites.js';
+import * as widgets from './core/widgets.js';
+
+// ---------------------------------------------------------------------------
+// tiny local helpers (deliberately NOT re-exported from core/ — each is a
+// couple of lines and does not earn a shared-file dependency)
+// ---------------------------------------------------------------------------
+
+function numOr(v, d) { return (typeof v === 'number' && Number.isFinite(v)) ? v : d; }
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+function withAlpha(hex, alpha) {
+  const s = (typeof hex === 'string' ? hex : '#000000').replace('#', '');
+  const full = s.length === 3 ? s.split('').map((c) => c + c).join('') : s;
+  const n = parseInt(full, 16) || 0;
+  const r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+  return `rgba(${r},${g},${b},${clamp(alpha, 0, 1)})`;
+}
+
+/** Truncate `text` (with a trailing "..") so it fits `maxW` px in the pixel
+ *  font at `scale` — the same bisection technique core/widgets.js's own
+ *  (unexported) clipTextToWidth uses, duplicated here at panel-layout scale
+ *  rather than requesting an export for one helper. */
+function fitText(ctx, text, maxW, scale) {
+  const s = String(text == null ? '' : text);
+  if (maxW <= 0) return '';
+  if (widgets.measurePixelText(ctx, s, scale) <= maxW) return s;
+  let lo = 0, hi = s.length;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    const cand = s.slice(0, mid) + '..';
+    if (widgets.measurePixelText(ctx, cand, scale) <= maxW) lo = mid; else hi = mid - 1;
+  }
+  return lo > 0 ? s.slice(0, lo) + '..' : '';
+}
+
+/** "team-03" -> "T3"; anything else -> its first 3 chars, upper-cased. Only
+ *  used for the ticker's tight one-liner (task brief's own worked example:
+ *  "d04 R7  T3 82 - 61 T6"); the bracket pane has room for full team ids. */
+function shortTeam(name) {
+  if (!name) return '??';
+  const m = /^team-?0*(\d+)$/i.exec(String(name));
+  if (m) return 'T' + m[1];
+  return String(name).slice(0, 3).toUpperCase();
+}
+
+/** Flat panel chrome — the same visual language as core/widgets.js's
+ *  (unexported) drawPanel, reimplemented here at the same couple-of-lines
+ *  size rather than requesting an export. */
+function panel(ctx, r, fill, border) {
+  ctx.save();
+  ctx.fillStyle = fill || theme.COLORS.panelBg;
+  ctx.fillRect(r.x, r.y, r.w, r.h);
+  ctx.strokeStyle = border || theme.COLORS.panelBorder;
+  ctx.lineWidth = theme.SIZES.borderWidth;
+  ctx.strokeRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
+  ctx.restore();
+}
+
+async function fetchJSON(url) {
+  try {
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null; // network error, CORS, malformed JSON -- never fatal to the view
+  }
+}
+
+// ---------------------------------------------------------------------------
+// canvas + responsive layout
+// ---------------------------------------------------------------------------
+
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+
+function resize() {
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const w = Math.max(320, window.innerWidth);
+  const h = Math.max(240, window.innerHeight);
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  canvas.style.width = w + 'px';
+  canvas.style.height = h + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+}
+window.addEventListener('resize', resize);
+resize();
+
+function computeLayout() {
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const W = canvas.width / dpr, H = canvas.height / dpr;
+  const tickerH = 30;
+  const bracketW = clamp(Math.round(W * 0.24), 240, 380);
+  return {
+    W, H,
+    bracket: { x: 0, y: 0, w: bracketW, h: H - tickerH },
+    featured: { x: bracketW, y: 0, w: W - bracketW, h: H - tickerH },
+    ticker: { x: 0, y: H - tickerH, w: W, h: tickerH },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// data state — the ONLY mutable module-level variables in this file
+// ---------------------------------------------------------------------------
+//
+// Two independent MatchState instances (both core/reduce.js's shared
+// reducer, never a second scorer of our own — CONTRACTS 10.2: "the UI
+// never computes a score"):
+//
+//   standingsState  — NEVER reset for the run's lifetime. Only ever folds a
+//                      synthetic `standings` L3 event this file builds each
+//                      /state poll (see applyStandings). Feeds the bracket
+//                      pane's table rows + knockout tree.
+//   duelMatchState   — the FEATURED duel's own reduced state, folded from
+//                      that one duel's live exchange stream (CONTRACTS
+//                      10.1's per-exchange GET /events). Reset to a fresh
+//                      createInitialState() every time the CAMERA CUTS to a
+//                      different duel_id; left alone across a round
+//                      advancing within the same duel (HP/credits/claims
+//                      carry forward, matching reduce.js's own model).
+//
+// A projector watches MANY duels but only ever renders ONE full combat
+// stream at a time (the featured pane) — both sides of a round defend in
+// SEPARATE exchange files (CONTRACTS 5.1's worked "d03-r06-A" example),
+// and folding two independently-advancing streams into one MatchState
+// would interleave nondeterministically. One stream is the spar-view unit
+// by design; the ticker covers the rest with a cheap per-duel HP snapshot
+// from /state instead of a full reduced stream each.
+
+const params = new URLSearchParams(location.search);
+const pinnedRunId = params.get('run');
+let runId = pinnedRunId;
+
+let tState = { run_id: null, standings: null, bracket: null, duels: [], featured: null };
+let standingsState = reduce.createInitialState();
+let standingsSeq = 0;
+
+let featuredDuelId = null;
+let featuredExchangeId = null;
+let featuredLastSwitchAt = 0;
+let duelMatchState = reduce.createInitialState();
+
+const MIN_BACKOFF = 125, MAX_BACKOFF = 1000; // CONTRACTS 10.1's polling cadence
+let eventsOffset = 0;
+let eventsBackoffMs = MIN_BACKOFF;
+
+const shownClaimKeys = new Set();
+const hpHistory = new Map(); // duel_id -> {hpA, hpB, hitAt}
+
+function mkSidePresentation() {
+  const now = performance.now();
+  return {
+    hpFrom: 100, hpTo: 100, hpChangedAt: now,
+    crFrom: 100, crTo: 100, crChangedAt: now, crDelta: 0,
+    latentCount: 0, latentChangedAt: -Infinity,
+    lastActionAt: -Infinity,
+  };
+}
+function freshPresentation() {
+  return { A: mkSidePresentation(), B: mkSidePresentation(), claimCutIn: null, shake: null, particles: [], roundBanner: null };
+}
+// The PRESENTATION-DIFF ADAPTER core/reduce.js's own header hands off to
+// the view layer: MatchState carries no from/to/changedAt tween fields on
+// purpose (folding the same events twice must give byte-identical state
+// regardless of how long that took on a real clock). This file diffs
+// successive MatchState snapshots and stamps performance.now() itself —
+// see diffPresentation() below.
+let presentation = freshPresentation();
+
+// ---------------------------------------------------------------------------
+// /state polling — the coarse, tournament-wide snapshot
+// ---------------------------------------------------------------------------
+
+/** Synthesize a local L3 `standings` event from a /state response and fold
+ *  it through the SAME shared reducer everything else uses (reduce.js's own
+ *  `case 'standings'` already does exactly "store p verbatim, mirror
+ *  p.bracket onto state.bracket" — this file is not reimplementing that
+ *  logic, only handing it real data). run_id/duel_id/exchange_id/round/
+ *  side/producer are all OMITTED, not just left undefined-ish, so
+ *  reduce()'s unconditional envelope-refresh block (which only overwrites
+ *  when a field is actually a string/number) never clobbers whatever the
+ *  FEATURED duel's own context currently is — these two reducers must stay
+ *  independent. */
+/** /state's TWO possible shapes, both real: arena.event_server's own
+ *  build_state_snapshot() forwards the last `standings`-typed L3 event's
+ *  payload VERBATIM as `data.standings` — CONTRACTS names no fixed schema
+ *  for it beyond "standings, bracket, current duel" (section 0: a local
+ *  decision), so a real `arena.standings` module, publishing ONE cohesive
+ *  snapshot, most plausibly nests `bracket` INSIDE that same payload
+ *  (`data.standings.bracket`) rather than as a bare top-level sibling; this
+ *  file's own fallback server additionally offers a top-level `data.bracket`
+ *  as a convenience. Both are checked, nested taking priority. */
+function applyStandings(data) {
+  const st = data.standings || {};
+  const bracket = 'bracket' in st ? st.bracket : data.bracket;
+  const p = { tableA: st.tableA, tableB: st.tableB, bracket };
+  const event = { v: 1, layer: 3, seq: standingsSeq++, t: performance.now() / 1000, type: 'standings', p };
+  standingsState = reduce.reduce(standingsState, event);
+}
+
+// ---------------------------------------------------------------------------
+// duel accessors — tolerate BOTH /state shapes in play on this project:
+// arena.event_server.build_state_snapshot's real, minimal one
+// (`{"duel_id","exchange_id","round","hp":{"A","B","round"},"round_end"?,
+// "duel_end"?}` — no team identity at all, an L1 fact outside that
+// endpoint's own stated scope: "this module owns the transport, not the
+// scoring") and this file's own fallback server's richer, additive
+// `sideA`/`sideB`/`status` superset. Preferring the richer shape when
+// present costs nothing and is the ONLY way team names ever show up before
+// a duel has been featured — see resolveDuelNames()/fetchDuelNames() below
+// for how the real shape's gap is closed.
+// ---------------------------------------------------------------------------
+
+/** Robust duel identity. Prefer the server's own `duel_id` when it is a
+ *  real, non-empty string; otherwise derive one from `exchange_id`'s own
+ *  shape (CONTRACTS 5.1's worked example: "<duel_id>-r<round>-<side>", e.g.
+ *  "d03-r06-A" -> "d03"). CONTRACTS 5.1's envelope names `duel_id` as a
+ *  top-level field the real `arena.event_server` does forward
+ *  (`build_state_snapshot` reads `event.get("duel_id")` off the
+ *  `exchange_start`/`hp`/etc. envelope verbatim) — so a well-formed run
+ *  populates it and this derivation is normally a no-op. It earns its keep
+ *  against anything that DOESN'T: a malformed producer, an older replay, or
+ *  (caught here first) a hand-authored test fixture that forgot the field.
+ *  Skipping this derivation on that kind of input collapses every duel to
+ *  the SAME identity (`null`), which pickFeatured/cutToFeatured/
+ *  drawFeaturedPane then all read as "no live duel" even while a real
+ *  HP/log stream is flowing underneath — the featured pane pinned
+ *  permanently to `NO LIVE DUEL` and the ticker showing `*null` for every
+ *  row; reproduced once with such a fixture, which is what motivated this
+ *  function. Every call site below uses `duelIdentity(d)`, never
+ *  `d.duel_id` directly, so a producer that DOES omit it still renders
+ *  correctly. */
+const DUEL_FROM_EXCHANGE_RE = /^(.*)-r\d+-[AB]$/;
+function duelIdentity(d) {
+  if (d && typeof d.duel_id === 'string' && d.duel_id) return d.duel_id;
+  if (d && typeof d.exchange_id === 'string') {
+    const m = DUEL_FROM_EXCHANGE_RE.exec(d.exchange_id);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+function duelHp(d) {
+  if (d.sideA && typeof d.sideA.hp === 'number') return { A: d.sideA.hp, B: d.sideB && d.sideB.hp };
+  if (d.hp) return { A: numOr(d.hp.A, 100), B: numOr(d.hp.B, 100) };
+  return { A: 100, B: 100 };
+}
+function duelCredits(d) {
+  if (d.sideA && typeof d.sideA.credits === 'number') return { A: d.sideA.credits, B: d.sideB && d.sideB.credits };
+  return { A: null, B: null };
+}
+function duelEnded(d) {
+  if (d.status) return d.status !== 'live';
+  return !!d.duel_end;
+}
+function duelTeamNames(d) {
+  if (d.sideA && d.sideA.team) return { A: d.sideA.team, B: d.sideB && d.sideB.team };
+  const cached = duelNameCache.get(duelIdentity(d));
+  return cached ? { A: cached.teamA, B: cached.teamB } : { A: null, B: null };
+}
+
+const duelNameCache = new Map(); // duel_id -> {teamA, teamB, exchangeId}
+const nameLookupInFlight = new Set();
+
+/** Recover team identity for a duel whose /state entry did not carry it
+ *  (the real event_server's shape never does — see duelTeamNames' doc) by
+ *  fetching that duel's OWN exchange stream once: `exchange_start` is
+ *  always its first event (CONTRACTS 5.1's worked "d03-r06-A" example).
+ *  One-shot per duel (cached), never re-fetched just because a later
+ *  /state poll still omits names — only the featured duel's own live
+ *  /events polling loop needs to stay current; this is a single cheap
+ *  bootstrap read for everyone ELSE, for the ticker's benefit. */
+function resolveDuelNames(duels) {
+  for (const d of duels) {
+    if (d.sideA && d.sideA.team) continue; // this server already told us
+    const id = duelIdentity(d);
+    if (id == null || duelNameCache.has(id) || nameLookupInFlight.has(id)) continue;
+    nameLookupInFlight.add(id);
+    fetchDuelNames(d).finally(() => nameLookupInFlight.delete(id));
+  }
+}
+
+async function fetchDuelNames(d) {
+  const id = duelIdentity(d);
+  if (!runId || !d.exchange_id || id == null) return;
+  const url = `/events?run=${encodeURIComponent(runId)}&exchange=${encodeURIComponent(d.exchange_id)}&after=0&limit=4096`;
+  const data = await fetchJSON(url);
+  if (!data || !Array.isArray(data.events)) return;
+  for (const raw of data.events) {
+    const event = decode.normalizeEvent(raw);
+    if (event && event.type === 'exchange_start') {
+      const p = event.p || {};
+      const attacker = typeof p.attacker === 'string' ? p.attacker : null;
+      const defender = typeof p.defender === 'string' ? p.defender : null;
+      const teamA = event.side === 'A' ? defender : attacker;
+      const teamB = event.side === 'A' ? attacker : defender;
+      duelNameCache.set(id, { teamA, teamB, exchangeId: d.exchange_id });
+      return;
+    }
+  }
+}
+
+function duelScore(d, now) {
+  const hp = duelHp(d);
+  const hpA = numOr(hp.A, 100), hpB = numOr(hp.B, 100);
+  const closeness = 100 - Math.abs(hpA - hpB); // 0..100, higher = a closer fight
+  const hist = hpHistory.get(duelIdentity(d));
+  let hitBonus = 0;
+  if (hist && typeof hist.hitAt === 'number') {
+    const age = now - hist.hitAt;
+    if (age >= 0 && age < 6000) hitBonus = 40 * (1 - age / 6000); // "just took the biggest hit"
+  }
+  return closeness + hitBonus;
+}
+
+function trackHpHistory(duels, now) {
+  for (const d of duels) {
+    const hp = duelHp(d);
+    const hpA = numOr(hp.A, null), hpB = numOr(hp.B, null);
+    const id = duelIdentity(d);
+    const prev = hpHistory.get(id);
+    let hitAt = prev ? prev.hitAt : undefined;
+    if (prev) {
+      if (prev.hpA != null && hpA != null && Math.abs(prev.hpA - hpA) >= 3) hitAt = now;
+      if (prev.hpB != null && hpB != null && Math.abs(prev.hpB - hpB) >= 3) hitAt = now;
+    }
+    hpHistory.set(id, { hpA, hpB, hitAt });
+  }
+}
+
+const EXCHANGE_ROUND_SIDE_RE = /-r(\d+)-([AB])$/;
+
+/** Collapse potentially many exchange-file rows per duel down to exactly
+ *  ONE: the CURRENT round, preferring the 'A' file at a round tie (both
+ *  sides of the same round are genuinely concurrent, CONTRACTS 5.1) —
+ *  mirroring projector/run_projector.py's own (fixed) `derive_duels`
+ *  exactly, so both server shapes converge on the same displayed duel.
+ *
+ *  Necessary specifically against the REAL `arena.event_server`: its own
+ *  `build_state_snapshot` keys `duels` by `exchange_id`, one row per
+ *  exchange FILE, and never collapses a duel's rounds into one row (its
+ *  own docstring: "the latest per-EXCHANGE hp/round_end/duel_end payload"
+ *  — per exchange, not per duel). Old rounds' files are never deleted
+ *  (CONTRACTS 5.3: "Events are never rewritten"), so an un-deduped
+ *  `/state`'s `duels` array grows one row per round for the life of a run
+ *  — without this, the ticker would show "d03 R6", "d03 R7", "d03 R8" ...
+ *  simultaneously for a SINGLE ongoing duel, not the task brief's own
+ *  "one scrolling line per concurrently running duel". It also silently
+ *  breaks the featured camera: the real server sorts `duels` by
+ *  `exchange_id` (alphabetical, so "…-r06-…" always precedes "…-r07-…"),
+ *  and `updateFeatured`'s own `duels.find(duelIdentity(d) === chosenId)`
+ *  would keep matching the FIRST (oldest) row for that id — the same-duel
+ *  re-point to a new round (see `updateFeatured`'s own comment on
+ *  `exchange_id !== featuredExchangeId`) would never fire, pinning the
+ *  featured pane to round 1 for the rest of the duel. Caught only by
+ *  actually loading this page against the live server with a two-round
+ *  fixture, not by reading either function alone. This file's own
+ *  fallback server already dedupes server-side (`derive_duels`); this
+ *  function makes the client correct against BOTH server shapes rather
+ *  than depending on which one answered.
+ *
+ *  MUST run before any `duelEnded()` filter: only the FINAL exchange of a
+ *  finished duel carries `duel_end` (CONTRACTS 5.2), so filtering first
+ *  would drop that entry and this function would then promote the
+ *  second-to-last round, which reads as "still live" forever. */
+function dedupeDuelsByCurrentRound(rawDuels) {
+  const best = new Map(); // duelIdentity -> {round, sideRank, entry}
+  for (const d of rawDuels) {
+    const id = duelIdentity(d);
+    if (id == null) continue;
+    const m = typeof d.exchange_id === 'string' ? EXCHANGE_ROUND_SIDE_RE.exec(d.exchange_id) : null;
+    const round = m ? parseInt(m[1], 10) : numOr(d.round, 0);
+    const sideRank = m && m[2] === 'A' ? 1 : 0; // 'A' ranks HIGHER so a plain `>` prefers it at a tie
+    const cur = best.get(id);
+    if (!cur || round > cur.round || (round === cur.round && sideRank > cur.sideRank)) {
+      best.set(id, { round, sideRank, entry: d });
+    }
+  }
+  return Array.from(best.values(), (v) => v.entry);
+}
+
+/** Manual override always wins outright (an instructor's explicit choice,
+ *  per FINAL-PLAN 8.3: "follow a manual override if one is set in /state").
+ *  Otherwise auto-pick by score, but with HYSTERESIS: a minimum 8 s hold
+ *  and a >=10-point margin before switching, so two duels sitting near the
+ *  same closeness score do not flip the camera every poll. */
+function pickFeatured(duels, overrideId, prevId, lastSwitchAt, now) {
+  if (!duels.length) return null;
+  if (overrideId && duels.some((d) => duelIdentity(d) === overrideId)) return overrideId;
+
+  let best = duels[0], bestScore = duelScore(duels[0], now);
+  for (let i = 1; i < duels.length; i++) {
+    const sc = duelScore(duels[i], now);
+    if (sc > bestScore) { best = duels[i]; bestScore = sc; }
+  }
+  const prev = duels.find((d) => duelIdentity(d) === prevId);
+  if (!prev) return duelIdentity(best); // nothing currently featured (or it ended) -> cut immediately
+  if (now - lastSwitchAt < 8000) return prevId;
+  if (bestScore - duelScore(prev, now) < 10) return prevId;
+  return duelIdentity(best);
+}
+
+function seedFromDuel(d) {
+  const now = performance.now();
+  const hp = duelHp(d), cr = duelCredits(d), names = duelTeamNames(d);
+  const hpA = numOr(hp.A, 100), hpB = numOr(hp.B, 100);
+  const crA = numOr(cr.A, 100), crB = numOr(cr.B, 100);
+  duelMatchState = {
+    ...duelMatchState,
+    duelId: duelIdentity(d), exchangeId: d.exchange_id, round: d.round || duelMatchState.round,
+    sides: {
+      A: { ...duelMatchState.sides.A, team: names.A || null, hp: hpA, credits: crA },
+      B: { ...duelMatchState.sides.B, team: names.B || null, hp: hpB, credits: crB },
+    },
+  };
+  presentation.A.hpFrom = presentation.A.hpTo = hpA; presentation.A.hpChangedAt = now;
+  presentation.B.hpFrom = presentation.B.hpTo = hpB; presentation.B.hpChangedAt = now;
+  presentation.A.crFrom = presentation.A.crTo = crA; presentation.A.crChangedAt = now;
+  presentation.B.crFrom = presentation.B.crTo = crB; presentation.B.crChangedAt = now;
+}
+
+/** Cut the camera to a new duel (or to nothing, `duelId === null`). A
+ *  fresh MatchState (advisor guidance: a stale HP bar from the PREVIOUS
+ *  featured duel lingering on screen until the new one's own first `hp`
+ *  event arrives would read as a bug on a live broadcast), pre-seeded
+ *  immediately from the /state duels entry so there is no 100/100 flash
+ *  before the real event history refolds it moments later. */
+function cutToFeatured(duelId, duels) {
+  featuredDuelId = duelId;
+  duelMatchState = reduce.createInitialState();
+  presentation = freshPresentation();
+  shownClaimKeys.clear();
+  eventsOffset = 0;
+  eventsBackoffMs = MIN_BACKOFF;
+  if (!duelId) { featuredExchangeId = null; return; }
+  const d = duels.find((x) => duelIdentity(x) === duelId);
+  featuredExchangeId = d ? d.exchange_id : null;
+  if (d) seedFromDuel(d);
+}
+
+function updateFeatured(data) {
+  const now = performance.now();
+  // arena.event_server's real /state does not filter out a finished duel
+  // (its own duel_end entry just stays in the list) -- the client decides
+  // what "currently running" means, here and in the ticker. Dedupe to the
+  // CURRENT round per duel BEFORE that filter (see
+  // dedupeDuelsByCurrentRound's doc: only the final exchange carries
+  // duel_end, so filtering first would drop it and this would then
+  // promote a stale earlier round as "still live").
+  const raw = Array.isArray(data.duels) ? data.duels : [];
+  const duels = dedupeDuelsByCurrentRound(raw).filter((d) => !duelEnded(d));
+  resolveDuelNames(duels);
+  trackHpHistory(duels, now);
+  const chosenId = pickFeatured(duels, data.featured, featuredDuelId, featuredLastSwitchAt, now);
+  const chosen = duels.find((d) => duelIdentity(d) === chosenId) || null;
+
+  if (chosenId !== featuredDuelId) {
+    cutToFeatured(chosenId, duels);
+    featuredLastSwitchAt = now;
+  } else if (chosen && chosen.exchange_id !== featuredExchangeId) {
+    // Same duel, advanced to a new round's own exchange file: keep
+    // HP/credits/claims (they are duel-scoped truth), just re-point the
+    // poller at the new file from ITS start (seq restarts at 0 per file —
+    // CONTRACTS 5.1).
+    featuredExchangeId = chosen.exchange_id;
+    eventsOffset = 0;
+    eventsBackoffMs = MIN_BACKOFF;
+  }
+}
+
+async function pollState() {
+  // arena.event_server's real GET /state requires `run` and returns a
+  // well-formed 400 without it (verified against the live module) -- there
+  // is no discovery route to learn a run_id from over HTTP by design (its
+  // own docstring: "this module owns the transport, not the scoring").
+  // Calling it anyway would just be a permanent, noisy 400 every second, so
+  // this file does not: with no runId yet, it shows WAITING FOR ARENA and
+  // keeps rescheduling, but the only way `runId` becomes non-null is the
+  // page's OWN `?run=` query param -- supplied either by a human, or by
+  // projector/run_projector.py's own launch-time auto-discovery when a run
+  // already exists on disk at the moment it opens the browser. Starting the
+  // page before any run exists at all (the documented normal case --
+  // README-INSTRUCTOR.md: "Open BEFORE the bracket") means reloading with
+  // `?run=<id>` once the bracket prints one is the operator's own step.
+  if (runId) {
+    const data = await fetchJSON(`/state?run=${encodeURIComponent(runId)}`);
+    if (data) {
+      tState = data;
+      applyStandings(data);
+      updateFeatured(data);
+    }
+  }
+  setTimeout(pollState, 1000);
+}
+
+// ---------------------------------------------------------------------------
+// /events polling — the featured duel's own live stream
+// ---------------------------------------------------------------------------
+
+function otherSide(s) { return s === 'A' ? 'B' : 'A'; }
+
+/** CONTRACTS 10.2's frozen render mapping: "mutation applied:true (L1) ->
+ *  screen shake + the class name in the attacker's colour". The attacker
+ *  is the OTHER side from the exchange's own envelope `side` (that side is
+ *  always the DEFENDER this exchange — CONTRACTS 5.2 / reduce.js's own
+ *  inference comment: the exchange belongs to whoever is defending). */
+function triggerMutationEffects(event, now) {
+  const defender = event.side;
+  const attackerColor = defender === 'A' ? theme.COLORS.sideB : theme.COLORS.sideA;
+  presentation.shake = { startedAt: now };
+  presentation.particles.push({
+    startedAt: now,
+    label: (event.p && event.p.class) ? String(event.p.class) : 'mutation',
+    color: attackerColor,
+  });
+  if (presentation.particles.length > 6) presentation.particles.splice(0, presentation.particles.length - 6);
+}
+
+/** Diff two successive MatchState snapshots and stamp the tween fields
+ *  hpBar/creditBar/latentFlags/claimCutIn/roundBanner expect — the exact
+ *  seam core/reduce.js's own header comment hands to the view layer. */
+function diffPresentation(before, after, now) {
+  for (const side of ['A', 'B']) {
+    const b = before.sides[side], a = after.sides[side];
+    const pr = presentation[side];
+    if (a.hp !== b.hp) { pr.hpFrom = pr.hpTo; pr.hpTo = a.hp; pr.hpChangedAt = now; }
+    if (a.credits !== b.credits) { pr.crDelta = a.credits - b.credits; pr.crFrom = pr.crTo; pr.crTo = a.credits; pr.crChangedAt = now; }
+    if (a.latent !== b.latent) { pr.latentCount = a.latent; pr.latentChangedAt = now; }
+    if (a.log.length !== b.log.length) {
+      const last = a.log[a.log.length - 1];
+      if (last && last.side === side && last.type === 'tool_call') pr.lastActionAt = now;
+    }
+    for (const claim of a.claims) {
+      if (claim.outcome === 'pending') continue;
+      const key = `${side}:${claim.exchangeId}:${claim.seq}`;
+      if (shownClaimKeys.has(key)) continue;
+      shownClaimKeys.add(key);
+      presentation.claimCutIn = {
+        active: true, startedAt: now,
+        prosecutingTeam: after.sides[side].team || side,
+        cls: claim.cls, evidence: claim.evidence, argument: claim.argument,
+        outcome: claim.outcome, weight: claim.weight, scaled: claim.scaled,
+      };
+    }
+  }
+  if (after.round !== before.round && after.round > 0) {
+    presentation.roundBanner = { round: after.round, totalRounds: 10, scale: after.roundScale, startedAt: now };
+  }
+}
+
+function processEvents(rawEvents) {
+  const before = duelMatchState;
+  const now = performance.now();
+  for (const raw of rawEvents) {
+    const event = decode.normalizeEvent(raw); // /events hands back ALREADY-PARSED objects (CONTRACTS 10.1)
+    if (!event) continue; // unknown v/type -- skipped, never fatal (CONTRACTS 5.1)
+    duelMatchState = reduce.reduce(duelMatchState, event);
+    if (event.type === 'mutation' && event.p && event.p.applied === true) {
+      triggerMutationEffects(event, now);
+    }
+  }
+  diffPresentation(before, duelMatchState, now);
+  // Drain the L4 choreography queue as an OPTIONAL hint, never a
+  // requirement — every render decision above already comes from L1/L2/L3
+  // per the frozen mapping; a `shake` hint here just avoids missing one
+  // that arrived with no corresponding `mutation` in this same batch.
+  const drained = reduce.drainChoreography(duelMatchState);
+  duelMatchState = drained.state;
+  for (const chor of drained.events) {
+    if (chor.type === 'shake' && !presentation.shake) {
+      presentation.shake = { startedAt: now, magnitude: chor.p && chor.p.magnitude };
+    }
+  }
+}
+
+/** One fetch+process cycle, factored out of pollEvents() so the debug hook
+ *  (window.__colosseumDebug.replayFeaturedFromStart) can drive exactly one cycle
+ *  synchronously without also scheduling the next one. */
+async function pollEventsOnce() {
+  if (runId && featuredExchangeId) {
+    const url = `/events?run=${encodeURIComponent(runId)}&exchange=${encodeURIComponent(featuredExchangeId)}&after=${eventsOffset}`;
+    const data = await fetchJSON(url);
+    if (data && Array.isArray(data.events)) {
+      if (data.events.length > 0) {
+        processEvents(data.events);
+        eventsBackoffMs = MIN_BACKOFF; // "immediate re-poll whenever a response was non-empty"
+      } else {
+        eventsBackoffMs = Math.min(MAX_BACKOFF, eventsBackoffMs * 1.6);
+      }
+      if (typeof data.next_offset === 'number' && data.next_offset >= eventsOffset) {
+        eventsOffset = data.next_offset;
+      }
+    } else {
+      eventsBackoffMs = Math.min(MAX_BACKOFF, eventsBackoffMs * 1.6);
+    }
+  } else {
+    eventsBackoffMs = Math.min(MAX_BACKOFF, eventsBackoffMs * 1.6);
+  }
+}
+
+async function pollEvents() {
+  await pollEventsOnce();
+  setTimeout(pollEvents, eventsBackoffMs);
+}
+
+// ---------------------------------------------------------------------------
+// combat-log formatting — reduce.js hands back STRUCTURED entries
+// ({seq,t,round,exchangeId,side,type,p}), never pre-formatted strings
+// (its own header comment: "Formatting ... is core/widgets.js's job").
+// This is the view-layer formatter widgets.combatLog's own doc calls for.
+// ---------------------------------------------------------------------------
+
+// `displayIndex`, when given, REPLACES `entry.seq` in the returned object
+// -- see mergeLogs' own doc comment on why: core/widgets.js's combatLog (a
+// shared, frozen widget — CONTRACTS 10, not this view's to edit) re-sorts
+// its `lines` input by `.seq` alone internally, so the raw per-exchange
+// `seq` (which resets to 0 at every round boundary) must never reach it
+// once two rounds are merged.
+function formatLogLine(entry, displayIndex) {
+  const p = entry.p || {};
+  const tag = entry.side || '-';
+  let text = `${tag} ${entry.type}`;
+  let costLabel = '';
+  let denied = false;
+  switch (entry.type) {
+    case 'tool_call':
+      text = `${tag} mcp  ${p.server || '?'}.${p.tool || '?'}`;
+      if (typeof p.cost === 'number') costLabel = `-${p.cost} cr`;
+      break;
+    case 'command':
+      text = `${tag} ${p.kind || 'cmd'}  ${(p.server || '') + (p.tool ? '.' + p.tool : '')}`.trim();
+      break;
+    case 'enforced':
+      denied = p.verdict_applied === 'deny';
+      text = `${tag} gateway ${p.verdict_applied || '?'}` + (p.reason ? ` -- ${p.reason}` : '');
+      break;
+    case 'decision':
+      text = `${tag} decide  ${p.verdict || '?'}`;
+      break;
+    case 'mutation':
+      text = `${tag} mutation ${p.class || '?'} ${p.applied ? 'APPLIED' : 'missed'}`;
+      break;
+    case 'answer':
+      text = `${tag} answer submitted`;
+      break;
+    case 'integrity':
+      text = `${tag} INTEGRITY ${p.kind || '?'}`;
+      break;
+    case 'model_turn':
+      text = `${tag} model turn ${numOr(p.iteration, '')}`;
+      break;
+    case 'recoil':
+      text = `${tag} recoil`;
+      break;
+    case 'penalty':
+      text = `${tag} penalty`;
+      break;
+    case 'own_telemetry':
+      text = `${tag} note: ${p.name || ''}`;
+      break;
+    case 'round_end':
+      text = `-- round ${entry.round || '?'} end --`;
+      break;
+    case 'duel_end':
+      text = '-- duel end --';
+      break;
+    default:
+      text = `${tag} ${entry.type}`;
+  }
+  return { seq: displayIndex != null ? displayIndex : entry.seq, text, costLabel, denied };
+}
+
+/** Both sides of a round defend in SEPARATE exchange files, but
+ *  reduce.js pushes a log entry only onto the side(s) an event names
+ *  (CONTRACTS 5.2), so a duel-wide combat log needs both `sides.A.log`
+ *  and `sides.B.log` merged and de-duplicated by (exchange, seq, side,
+ *  type) — a `round_end`/`duel_end` line, for instance, is pushed to BOTH
+ *  sides by reduce.js's own `pushLogTo(s, event, ['A','B'])`.
+ *
+ *  Sort key is `(round, seq)`, NOT `seq` alone: `seq` resets to 0 at the
+ *  START of every exchange FILE (CONTRACTS 5.3), and `updateFeatured`'s own
+ *  same-duel-new-round re-point (`exchange_id !== featuredExchangeId`)
+ *  keeps `duelMatchState.sides.*.log` accumulating across that boundary on
+ *  purpose (HP/credits/claims/log all carry forward duel-wide) — so once a
+ *  duel advances from round 6 to round 7, this list holds round 6's
+ *  seq-0..N followed by round 7's seq-0..M, and a `seq`-only sort would
+ *  interleave them (0(r6), 0(r7), 1(r6), 1(r7), …) instead of keeping
+ *  round 6 entirely before round 7. Every entry carries `round`
+ *  (formatLogLine's own doc: reduce.js hands back `{seq,t,round,
+ *  exchangeId,side,type,p}`), so this costs nothing extra to fix.
+ *
+ *  **That sort alone is not enough.** `core/widgets.js`'s own `combatLog`
+ *  — shared, frozen, not this view's file to edit (CONTRACTS 10) —
+ *  re-sorts whatever `lines` array it is handed by `.seq` ALONE,
+ *  internally, unconditionally (its own source: `rawLines.slice().sort((a,
+ *  b) => num(a.seq,0) - num(b.seq,0))`). Handing it the raw per-exchange
+ *  `seq` after the sort above would let THAT re-sort silently undo it —
+ *  round 7's seq-1 line would still sort ahead of round 6's seq-2 line,
+ *  because the widget has no `round` field to break the tie with.
+ *  Reproduced by actually loading this page against a two-round fixture
+ *  and reading the RENDERED pixel text (cropped/zoomed for legibility),
+ *  not by reading either function's source in isolation — the sort here
+ *  looked correct and the widget's own re-sort looked correct, and each
+ *  was, alone. The fix stays entirely on this side of that boundary:
+ *  `formatLogLine`'s second argument overwrites `entry.seq` with `i`, the
+ *  position in this already-correctly-sorted array, so the widget's own
+ *  `.seq` sort becomes a no-op (a `0..N-1` array is already sorted by that
+ *  key) — and the resulting on-screen counter reads as "the i-th action of
+ *  the whole duel" rather than resetting to 0000 every round, which is
+ *  arguably the more honest label for a multi-round log anyway. */
+function mergeLogs(logA, logB) {
+  const seen = new Set();
+  const merged = [];
+  for (const line of logA.concat(logB)) {
+    const key = `${line.exchangeId}:${line.seq}:${line.side}:${line.type}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    merged.push(line);
+  }
+  merged.sort((a, b) => (numOr(a.round, 0) - numOr(b.round, 0)) || ((a.seq || 0) - (b.seq || 0)));
+  return merged.map((line, i) => formatLogLine(line, i));
+}
+
+// ---------------------------------------------------------------------------
+// rendering — one pane at a time
+// ---------------------------------------------------------------------------
+
+function drawWaitingCard(ctx, rect, t) {
+  const cx = rect.x + rect.w / 2, cy = rect.y + rect.h / 2;
+  const pulse = 0.55 + 0.45 * Math.sin(t / 500);
+  const title = 'WAITING FOR ARENA';
+  const scale = clamp(Math.floor(rect.w / 220), 3, 7);
+  const tw = widgets.measurePixelText(ctx, title, scale);
+  widgets.drawPixelText(ctx, cx - tw / 2, cy - 7 * scale, title, withAlpha(theme.COLORS.text, pulse), scale);
+
+  // Two short clauses, not one long line. The single-line version
+  // ("instructor arena not running yet -- second screen is live and
+  // waiting", 71 chars) measured its own width but never clamped it
+  // against `rect.w` — at this card's own font scale that line runs wider
+  // than an ordinary projector viewport and overflows BOTH edges,
+  // illegible on exactly the screen this card exists to reassure.
+  // Reproduced by actually loading this page with no run on disk and
+  // reading the rendered pixel text, not by reading the code. Shrink the
+  // font first, then fall back to fitText's own ellipsis-truncation, so
+  // this degrades gracefully at any realistic canvas size rather than
+  // just clipping at the edges.
+  const subLines = ['instructor arena not running yet', 'second screen is live and waiting'];
+  const maxSubW = Math.max(40, rect.w - 40);
+  let subScale = Math.max(1, scale - 2);
+  while (subScale > 1 && subLines.some((line) => widgets.measurePixelText(ctx, line, subScale) > maxSubW)) {
+    subScale -= 1;
+  }
+  const lineGap = 7 * subScale + 4;
+  subLines.forEach((line, i) => {
+    const clipped = fitText(ctx, line, maxSubW, subScale);
+    const w = widgets.measurePixelText(ctx, clipped, subScale);
+    widgets.drawPixelText(ctx, cx - w / 2, cy + 10 + i * lineGap, clipped, theme.COLORS.textDim, subScale);
+  });
+}
+
+function drawNoLiveDuel(ctx, rect, t) {
+  const cx = rect.x + rect.w / 2, cy = rect.y + rect.h / 2;
+  const label = 'NO LIVE DUEL';
+  const scale = 3;
+  const w = widgets.measurePixelText(ctx, label, scale);
+  widgets.drawPixelText(ctx, cx - w / 2, cy - 4, label, theme.COLORS.textDim, scale);
+}
+
+function drawTableRows(ctx, rect, label, rows) {
+  const scale = 1;
+  let y = rect.y;
+  widgets.drawPixelText(ctx, rect.x, y, label, theme.COLORS.textDim, scale + 1);
+  y += 7 * (scale + 1) + 3;
+  widgets.drawPixelText(ctx, rect.x, y, 'TEAM        PTS  HPD  FLG', theme.COLORS.textDim, scale);
+  y += 7 * scale + 3;
+
+  const list = Array.isArray(rows) ? rows : [];
+  if (list.length === 0) {
+    widgets.drawPixelText(ctx, rect.x, y, '(no standings yet)', theme.COLORS.textDim, scale);
+    return y + 7 * scale + 6;
+  }
+  for (const row of list.slice(0, 4)) {
+    const qualifies = list.indexOf(row) < 2;
+    if (qualifies) {
+      ctx.save();
+      ctx.fillStyle = withAlpha(theme.COLORS.sideA, 0.12);
+      ctx.fillRect(rect.x - 2, y - 1, rect.w + 4, 7 * scale + 2);
+      ctx.restore();
+    }
+    const team = fitText(ctx, String(row.team || '?'), 70, scale);
+    const pts = String(numOr(row.pts, 0)).padStart(2, ' ');
+    const diff = numOr(row.hp_diff, 0);
+    const hpd = (diff > 0 ? '+' : '') + String(diff);
+    const flg = String(numOr(row.flags, 0));
+    widgets.drawPixelText(ctx, rect.x, y, team, qualifies ? theme.COLORS.text : theme.COLORS.textDim, scale);
+    widgets.drawPixelText(ctx, rect.x + 76, y, pts, theme.COLORS.text, scale);
+    widgets.drawPixelText(ctx, rect.x + 102, y, hpd, theme.COLORS.text, scale);
+    widgets.drawPixelText(ctx, rect.x + 138, y, flg, theme.COLORS.unprovenGrey, scale);
+    y += 7 * scale + 3;
+  }
+  return y + 6;
+}
+
+function drawKnockout(ctx, rect, bracket) {
+  const b = bracket || {};
+  const slots = [['SEMI 1', b.semi1], ['SEMI 2', b.semi2], ['3RD PLACE', b.third], ['FINAL', b.final]];
+  const rowH = Math.max(20, Math.floor(rect.h / slots.length));
+  let y = rect.y;
+  const scale = 1;
+  for (const [label, m] of slots) {
+    const box = { x: rect.x, y, w: rect.w, h: Math.max(18, rowH - 3) };
+    panel(ctx, box, theme.COLORS.bg, theme.COLORS.panelBorder);
+    widgets.drawPixelText(ctx, box.x + 4, box.y + 2, label, theme.COLORS.textDim, scale);
+    const a = m && m.a ? fitText(ctx, String(m.a), Math.floor((box.w - 30) / 2), scale) : 'TBD';
+    const bside = m && m.b ? fitText(ctx, String(m.b), Math.floor((box.w - 30) / 2), scale) : 'TBD';
+    widgets.drawPixelText(ctx, box.x + 4, box.y + 2 + 7 * scale + 3, `${a} vs ${bside}`, theme.COLORS.text, scale);
+    if (m && m.winner) {
+      const wtxt = `W: ${fitText(ctx, String(m.winner), box.w - 30, scale)}`;
+      widgets.drawPixelText(ctx, box.x + 4, box.y + box.h - 9, wtxt, theme.COLORS.sideA, scale);
+    }
+    y += rowH;
+  }
+}
+
+function drawBracketPane(ctx, rect, t) {
+  panel(ctx, rect);
+  const pad = 8;
+  let y = rect.y + pad;
+  widgets.drawPixelText(ctx, rect.x + pad, y, 'BRACKET', theme.COLORS.text, 2);
+  if (runId) {
+    const idLabel = String(runId);
+    const idScale = 1;
+    const idw = widgets.measurePixelText(ctx, idLabel, idScale);
+    widgets.drawPixelText(ctx, rect.x + rect.w - pad - idw, y + 3, idLabel, theme.COLORS.textDim, idScale);
+  }
+  y += 7 * 2 + 8;
+
+  const st = standingsState.standings || {};
+  const knockoutH = 4 * 34;
+  const tableH = Math.max(60, Math.floor((rect.y + rect.h - pad - knockoutH - y) / 2));
+
+  y = drawTableRows(ctx, { x: rect.x + pad, y, w: rect.w - pad * 2 }, 'TABLE A (seeds 1,4,5,8)', st.tableA);
+  y = drawTableRows(ctx, { x: rect.x + pad, y, w: rect.w - pad * 2 }, 'TABLE B (seeds 2,3,6,7)', st.tableB);
+
+  drawKnockout(ctx, { x: rect.x + pad, y, w: rect.w - pad * 2, h: Math.max(60, rect.y + rect.h - pad - y) }, standingsState.bracket);
+}
+
+function drawAgent(ctx, side, x, y, scale, t) {
+  const pr = presentation[side];
+  const hurting = pr.hpTo < pr.hpFrom && (t - pr.hpChangedAt) >= 0 && (t - pr.hpChangedAt) < theme.TIMINGS.hpFlashMs;
+  const attacking = (t - pr.lastActionAt) >= 0 && (t - pr.lastActionAt) < 300;
+  const key = hurting ? 'hurt' : (attacking ? 'attack' : 'idle');
+  const bank = sprites.decoded && sprites.decoded['agent' + side];
+  const sheet = bank && (bank[key] || bank.idle);
+  if (sheet) sprites.drawSprite(ctx, sheet, x, y, scale);
+}
+
+//: Height of the five-stage strip inside the featured pane. Carved out of the
+//: combat log's own height rather than added to the pane, so the projector
+//: keeps filling exactly the display it was given.
+const PIPE_STRIP_H = 76;
+
+function drawFeaturedPane(ctx, rect, t) {
+  panel(ctx, rect);
+
+  if (!featuredDuelId) {
+    drawNoLiveDuel(ctx, rect, t);
+    return;
+  }
+
+  const shake = widgets.screenShake(presentation.shake, t);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(rect.x, rect.y, rect.w, rect.h);
+  ctx.clip();
+  ctx.translate(shake.dx, shake.dy);
+
+  const pad = 12;
+  const barW = Math.floor((rect.w - pad * 2 - 16) / 2);
+  const hpH = theme.SIZES.hpBarHeight, crH = theme.SIZES.creditBarHeight;
+
+  let y = rect.y + pad;
+  const nameA = fitText(ctx, duelMatchState.sides.A.team || 'TEAM A', barW, 2);
+  const nameB = fitText(ctx, duelMatchState.sides.B.team || 'TEAM B', barW, 2);
+  widgets.drawPixelText(ctx, rect.x + pad, y, nameA, theme.COLORS.sideA, 2);
+  const nameBw = widgets.measurePixelText(ctx, nameB, 2);
+  widgets.drawPixelText(ctx, rect.x + rect.w - pad - nameBw, y, nameB, theme.COLORS.sideB, 2);
+  y += 7 * 2 + 5;
+
+  widgets.hpBar(ctx, { x: rect.x + pad, y, w: barW, h: hpH },
+    { side: 'A', hpMax: 100, from: presentation.A.hpFrom, to: presentation.A.hpTo, changedAt: presentation.A.hpChangedAt }, t);
+  widgets.hpBar(ctx, { x: rect.x + rect.w - pad - barW, y, w: barW, h: hpH },
+    { side: 'B', hpMax: 100, from: presentation.B.hpFrom, to: presentation.B.hpTo, changedAt: presentation.B.hpChangedAt }, t);
+  y += hpH + 3;
+
+  widgets.creditBar(ctx, { x: rect.x + pad, y, w: barW, h: crH },
+    { side: 'A', creditsMax: 100, from: presentation.A.crFrom, to: presentation.A.crTo, changedAt: presentation.A.crChangedAt, delta: presentation.A.crDelta }, t);
+  widgets.creditBar(ctx, { x: rect.x + rect.w - pad - barW, y, w: barW, h: crH },
+    { side: 'B', creditsMax: 100, from: presentation.B.crFrom, to: presentation.B.crTo, changedAt: presentation.B.crChangedAt, delta: presentation.B.crDelta }, t);
+  y += crH + 5;
+
+  widgets.latentFlags(ctx, { x: rect.x + pad, y, w: 80, h: 12 }, { count: presentation.A.latentCount, changedAt: presentation.A.latentChangedAt }, t);
+  widgets.latentFlags(ctx, { x: rect.x + rect.w - pad - 80, y, w: 80, h: 12 }, { count: presentation.B.latentCount, changedAt: presentation.B.latentChangedAt }, t);
+  y += 18;
+
+  // Persistent HUD strip (no `startedAt` -> widgets.roundBanner draws fully
+  // opaque and always-on, per its own doc comment).
+  widgets.roundBanner(ctx, { x: rect.x + pad, y, w: rect.w - pad * 2, h: 26 }, { round: duelMatchState.round || 1, totalRounds: 10, scale: duelMatchState.roundScale || 1 }, t);
+  y += 26 + 8;
+
+  const combatLogH = clamp(Math.floor(rect.h * 0.22), 90, 160);
+  const spriteScale = clamp(Math.floor(rect.w / 90), 4, 10);
+  const spriteBoxH = 16 * spriteScale;
+  const midH = Math.max(48, rect.y + rect.h - pad - combatLogH - PIPE_STRIP_H - 12 - y);
+  const spriteY = y + Math.max(0, (midH - spriteBoxH) / 2);
+
+  drawAgent(ctx, 'A', rect.x + pad + 16, spriteY, spriteScale, t);
+  drawAgent(ctx, 'B', rect.x + rect.w - pad - 16 - 16 * spriteScale, spriteY, spriteScale, t);
+  const vs = 'VS';
+  const vsScale = clamp(Math.floor(spriteScale / 2), 2, 4);
+  const vsw = widgets.measurePixelText(ctx, vs, vsScale);
+  widgets.drawPixelText(ctx, rect.x + rect.w / 2 - vsw / 2, spriteY + spriteBoxH / 2 - 3.5 * vsScale, vs, theme.COLORS.textDim, vsScale);
+  y += midH;
+
+  const merged = mergeLogs(duelMatchState.sides.A.log, duelMatchState.sides.B.log);
+  widgets.combatLog(ctx, { x: rect.x + pad, y, w: rect.w - pad * 2, h: combatLogH }, { lines: merged }, t);
+
+  // The five stages of the exchange currently on camera, under the log. Which
+  // SIDE is defending is read off the exchange id's own `-A`/`-B` suffix (the
+  // `d03-r06-A` convention: the trailing letter is the DEFENDER), the same
+  // inference core/reduce.js documents for exchange_start.
+  const defSide = /-B$/.test(String(featuredExchangeId || '')) ? 'B' : 'A';
+  const stripY = y + combatLogH + 12;
+  widgets.drawPixelText(ctx, rect.x + pad, stripY - 9,
+                        `${defSide === 'A' ? nameA : nameB} DEFENDS — QUESTION > ACTION > ANSWER > EVAL > REFEREE`,
+                        defSide === 'B' ? theme.COLORS.sideB : theme.COLORS.sideA, 1);
+  widgets.pipelinePanel(ctx, { x: rect.x + pad, y: stripY, w: rect.w - pad * 2, h: PIPE_STRIP_H },
+                        duelMatchState, defSide, t);
+
+  for (const p of presentation.particles) {
+    widgets.particleBurst(ctx, rect, { startedAt: p.startedAt, x: rect.x + rect.w / 2, y: rect.y + 40, color: p.color, label: p.label }, t);
+  }
+
+  ctx.restore(); // undo shake + clip before the cut-in, which should not itself shake
+
+  if (presentation.claimCutIn && presentation.claimCutIn.active) {
+    // Above the log, and provably clear of the five-stage strip -- the bound is
+    // computed by widgets.cutInRect, which is unit-tested for exactly that.
+    const cutRect = widgets.cutInRect(rect, y, stripY);
+    widgets.claimCutIn(ctx, cutRect, presentation.claimCutIn, t);
+  }
+}
+
+function tickerLine(d) {
+  const hp = duelHp(d);
+  const hpA = Math.round(numOr(hp.A, 100));
+  const hpB = Math.round(numOr(hp.B, 100));
+  const names = duelTeamNames(d);
+  const ta = shortTeam(names.A);
+  const tb = shortTeam(names.B);
+  const id = duelIdentity(d);
+  const mark = id != null && id === featuredDuelId ? '*' : ' ';
+  return `${mark}${id || '??'} R${numOr(d.round, '?')}  ${ta} ${hpA} - ${hpB} ${tb}`;
+}
+
+function drawTickerPane(ctx, rect, t) {
+  panel(ctx, rect);
+  const scale = 1;
+  const raw = Array.isArray(tState.duels) ? tState.duels : [];
+  const duels = dedupeDuelsByCurrentRound(raw)
+    .filter((d) => !duelEnded(d))
+    .sort((a, b) => String(duelIdentity(a)).localeCompare(String(duelIdentity(b))));
+  const y = rect.y + Math.floor((rect.h - 7 * scale) / 2);
+
+  if (duels.length === 0) {
+    widgets.drawPixelText(ctx, rect.x + 8, y, 'no duels running', theme.COLORS.textDim, scale);
+    return;
+  }
+
+  const full = duels.map(tickerLine).join('     |     ') + '     |     ';
+  const textW = widgets.measurePixelText(ctx, full, scale);
+  const cycle = textW + 40;
+  const speed = 45; // px/sec, deterministic in t (no randomness -- CONTRACTS 11's spirit)
+  const offset = (t / 1000 * speed) % cycle;
+  const x0 = rect.x + rect.w - offset;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(rect.x, rect.y, rect.w, rect.h);
+  ctx.clip();
+  widgets.drawPixelText(ctx, x0, y, full, theme.COLORS.text, scale);
+  widgets.drawPixelText(ctx, x0 - cycle, y, full, theme.COLORS.text, scale);
+  widgets.drawPixelText(ctx, x0 + cycle, y, full, theme.COLORS.text, scale);
+  ctx.restore();
+}
+
+// ---------------------------------------------------------------------------
+// per-frame presentation-state cleanup (bounded lifetimes, defence in depth
+// — every widget already stops drawing on its own past its TIMINGS window;
+// this just lets the objects themselves be released)
+// ---------------------------------------------------------------------------
+
+function tickPresentation(now) {
+  if (presentation.claimCutIn && now - presentation.claimCutIn.startedAt > theme.TIMINGS.cutinHoldMs) {
+    presentation.claimCutIn = null;
+  }
+  if (presentation.shake && now - presentation.shake.startedAt > theme.TIMINGS.shakeMs) {
+    presentation.shake = null;
+  }
+  if (presentation.particles.length) {
+    presentation.particles = presentation.particles.filter((p) => now - p.startedAt <= theme.TIMINGS.particleMs);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// main render loop
+// ---------------------------------------------------------------------------
+
+function frame(t) {
+  const now = performance.now();
+  tickPresentation(now);
+  const layout = computeLayout();
+
+  ctx.fillStyle = theme.COLORS.bg;
+  ctx.fillRect(0, 0, layout.W, layout.H);
+
+  if (!runId) {
+    drawWaitingCard(ctx, { x: 0, y: 0, w: layout.W, h: layout.H }, now);
+  } else {
+    drawBracketPane(ctx, layout.bracket, now);
+    drawFeaturedPane(ctx, layout.featured, now);
+    drawTickerPane(ctx, layout.ticker, now);
+  }
+
+  requestAnimationFrame(frame);
+}
+
+// A small, read-only debug window into otherwise module-scoped state --
+// harmless in production (nothing here is written back, and the module
+// scope stays the only place any of this is MUTATED), and genuinely useful
+// on run day: an instructor's own devtools console can inspect
+// `window.__colosseumDebug.duelMatchState()` etc. without this file growing a
+// whole debug UI. Getters, not snapshots, so each read reflects the
+// CURRENT value, not the value at page load.
+window.__colosseumDebug = {
+  duelMatchState: () => duelMatchState,
+  standingsState: () => standingsState,
+  presentation: () => presentation,
+  tState: () => tState,
+  featuredDuelId: () => featuredDuelId,
+  runId: () => runId,
+  // Testing-only replay hook: reset the featured duel's own fold and
+  // re-run ONE events fetch+process cycle, so a caller can observe the
+  // resulting `presentation` (a claimCutIn / shake trigger, in particular)
+  // within a single synchronous round trip instead of racing real wall-
+  // clock TIMINGS windows (cutinHoldMs=3000ms, shakeMs=400ms) against
+  // external tool latency.
+  replayFeaturedFromStart: async () => {
+    if (!featuredDuelId) return null;
+    const duels = Array.isArray(tState.duels) ? tState.duels : [];
+    cutToFeatured(featuredDuelId, duels);
+    await pollEventsOnce();
+    return presentation;
+  },
+};
+
+pollState();
+pollEvents();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>

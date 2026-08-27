@@ -1,0 +1,13 @@
+[project]
+name = "day26-colosseum-kit"
+version = "1.0.0"
+description = "COLOSSEUM — Day 26 competitive lab, student kit. Zero third-party runtime deps."
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# no -q here: the Makefile controls verbosity, and -q + -q silences the summary entirely

@@ -1,0 +1,867 @@
+<!-- kit/arena_ui/spar.src.html
+     COLOSSEUM — SparView, the student-facing single-duel pixel HUD
+     (CONTRACTS.md section 10, FINAL-PLAN.md section 8.2). DEV SOURCE: this
+     file imports core/*.js as real ES modules for editing/testing in a
+     browser served over http (`make ui`). build_ui.py inlines every one of
+     those imports into a self-contained spar.html with no external
+     references at all — see build_ui.py's own header for how.
+
+     One fixed 16:9 logical canvas (960x540), scaled to fit the viewport,
+     nearest-neighbour, DPR-aware. No CSS framework, no webfont, no CDN —
+     every glyph and sprite is drawn by core/font.js / core/sprites.js.
+
+     Query params:
+       ?run=<id>&exchange=<id>   poll the live event server (CONTRACTS 10.1):
+                                  GET /events?run=..&exchange=..&after=..&limit=..
+       ?replay=<path>            fetch a FINISHED JSONL directly (same-origin
+                                  relative path) and fold it through the exact
+                                  same decode.js + reduce.js pipeline — CONTRACTS
+                                  is explicit that there is no replay flag in the
+                                  reducer, only a different event SOURCE, so the
+                                  distinction lives entirely in the two Source
+                                  implementations below, never in how an event
+                                  is decoded or folded.
+       ?you=A|B                  which trace-side letter is "you" (default A).
+                                  Left screen slot is always drawn "A-style"
+                                  (teal, agentA sprite, left-fill HP bar) and
+                                  the right slot always "B-style" (amber,
+                                  agentB sprite, mirrored HP bar) REGARDLESS of
+                                  which literal side you are — core/theme.js's
+                                  own header: "sides — fixed identity...; the
+                                  composing view decides which side lands on
+                                  which half of the screen." This file is that
+                                  composing view; `you` only selects which
+                                  MatchState slice feeds the left slot.
+
+     With no query params at all this file still renders a full idle HUD
+     (100/100 both sides) and, best-effort, tries `tests/sample_exchange.jsonl`
+     as a same-origin relative replay so opening it with nothing set still
+     shows something real rather than a blank screen — see BOOT below. -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>COLOSSEUM — Spar</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; padding: 0; width: 100%; height: 100%;
+    background: #0a0e16; /* == theme.js COLORS.bg, duplicated here since CSS
+                             loads before any module does */
+    overflow: hidden;
+  }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+  }
+  #stage {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: #0a0e16;
+    touch-action: none;
+  }
+  #noscript-msg {
+    color: #e7ecf7; text-align: center; max-width: 40em; padding: 2em;
+  }
+</style>
+</head>
+<body>
+<noscript><p id="noscript-msg">COLOSSEUM requires JavaScript — this HUD renders entirely on
+&lt;canvas&gt;, no server-side rendering fallback exists.</p></noscript>
+<canvas id="stage" aria-label="COLOSSEUM duel HUD"></canvas>
+
+<script type="module">
+import { normalizeEvent, parseLine } from './core/decode.js';
+import { createInitialState, reduce } from './core/reduce.js';
+import { decoded as SPRITES, drawSprite } from './core/sprites.js';
+import {
+  hpBar, creditBar, latentFlags, combatLog, claimCutIn, roundBanner, scrubber,
+  pipelinePanel, screenShake, particleBurst, drawPixelText, measurePixelText,
+} from './core/widgets.js';
+import { COLORS, SIZES, TIMINGS, outcomeColor } from './core/theme.js';
+
+// ===========================================================================
+// 1. canvas — fixed 16:9 logical resolution, scaled to fit, DPR-aware
+// ===========================================================================
+
+const LOGICAL_W = 960;
+// 960x700, not 960x540. The extra 160px is the two five-stage pipeline strips
+// (QUESTION -> ACTION -> ANSWER -> EVAL -> REFEREE), one per side. The canvas is
+// letterboxed to fit whatever viewport it lands in, so the aspect ratio is a
+// layout choice rather than a constraint, and showing the shape of an exchange
+// is worth more than holding 16:9.
+const LOGICAL_H = 700;
+
+const canvas = document.getElementById('stage');
+const ctx = canvas.getContext('2d');
+
+function resizeCanvas() {
+  const dpr = Math.max(1, window.devicePixelRatio || 1);
+  const availW = window.innerWidth;
+  const availH = window.innerHeight;
+  const scale = Math.max(0.1, Math.min(availW / LOGICAL_W, availH / LOGICAL_H));
+  const cssW = Math.floor(LOGICAL_W * scale);
+  const cssH = Math.floor(LOGICAL_H * scale);
+  canvas.style.width = `${cssW}px`;
+  canvas.style.height = `${cssH}px`;
+  canvas.width = Math.round(LOGICAL_W * dpr);
+  canvas.height = Math.round(LOGICAL_H * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+function toLogicalXY(clientX, clientY) {
+  const r = canvas.getBoundingClientRect();
+  const scaleX = LOGICAL_W / Math.max(1, r.width);
+  const scaleY = LOGICAL_H / Math.max(1, r.height);
+  return { x: (clientX - r.left) * scaleX, y: (clientY - r.top) * scaleY };
+}
+
+// ===========================================================================
+// 2. query params
+// ===========================================================================
+
+const params = new URLSearchParams(window.location.search);
+const RUN_ID = params.get('run');
+const EXCHANGE_ID = params.get('exchange');
+const REPLAY_PATH = params.get('replay');
+const YOU = params.get('you') === 'B' ? 'B' : 'A';
+const OPPONENT = YOU === 'A' ? 'B' : 'A';
+const LIMIT_BYTES = 65536;
+
+// ===========================================================================
+// 3. sources — one shared shape: poll(afterOffset) -> Promise<{events, next_offset, eof}>
+//    `events` is always an array of already-DECODED (decode.js-normalized)
+//    event objects, nulls filtered — the two implementations differ only in
+//    HOW they get bytes, never in how those bytes become an event.
+// ===========================================================================
+
+/** Polls the live event server (CONTRACTS 10.1). */
+class LiveSource {
+  constructor(runId, exchangeId) {
+    this.runId = runId;
+    this.exchangeId = exchangeId;
+  }
+  async poll(afterOffset) {
+    const qs = new URLSearchParams({
+      run: this.runId, exchange: this.exchangeId,
+      after: String(afterOffset), limit: String(LIMIT_BYTES),
+    });
+    const res = await fetch(`/events?${qs.toString()}`, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`GET /events -> HTTP ${res.status}`);
+    const body = await res.json();
+    const rawEvents = Array.isArray(body.events) ? body.events : [];
+    const events = rawEvents.map(normalizeEvent).filter((e) => e !== null);
+    const nextOffset = typeof body.next_offset === 'number' ? body.next_offset : afterOffset;
+    return { events, next_offset: nextOffset, eof: !!body.eof };
+  }
+}
+
+/** Reads a finished JSONL file once (same-origin relative fetch) and serves
+ *  it back through the exact same {events, next_offset, eof} shape as the
+ *  live server, sliced by byte offset — so the scrubber can seek freely and
+ *  the polling loop below never has to know it isn't live. */
+class ReplaySource {
+  constructor(path) {
+    this.path = path;
+    this._bytes = null; // Uint8Array, loaded lazily on first poll()
+  }
+  async _ensureLoaded() {
+    if (this._bytes !== null) return;
+    const res = await fetch(this.path, { cache: 'no-store' });
+    if (!res.ok) throw new Error(`GET ${this.path} -> HTTP ${res.status}`);
+    const text = await res.text();
+    this._bytes = new TextEncoder().encode(text);
+  }
+  get totalBytes() {
+    return this._bytes ? this._bytes.length : 0;
+  }
+  async poll(afterOffset, limitBytes) {
+    await this._ensureLoaded();
+    const bytes = this._bytes;
+    const start = Math.max(0, Math.min(afterOffset, bytes.length));
+    const cap = typeof limitBytes === 'number' ? limitBytes : LIMIT_BYTES;
+    const end = Math.min(bytes.length, start + cap);
+    // COMPLETE LINES ONLY (CONTRACTS 5.3 / 10.1): withhold anything after the
+    // last newline in this window rather than return a partial trailing line.
+    let commitEnd = end;
+    if (end < bytes.length) {
+      let i = end;
+      while (i > start && bytes[i - 1] !== 10 /* \n */) i--;
+      commitEnd = i > start ? i : end; // a single line longer than the whole
+                                        // window still eventually resolves as
+                                        // limitBytes grows across polls
+    }
+    const slice = bytes.subarray(start, commitEnd);
+    const text = new TextDecoder('utf-8').decode(slice);
+    const lines = text.split('\n').filter((l) => l.trim() !== '');
+    const events = lines.map(parseLine).filter((e) => e !== null);
+    const eof = commitEnd >= bytes.length;
+    return { events, next_offset: commitEnd, eof };
+  }
+}
+
+// ===========================================================================
+// 4. state — the authoritative MatchState (reduce.js) plus this file's own
+//    VIEW-LOCAL choreography ("fx"), derived by diffing successive
+//    MatchState snapshots — exactly the adapter reduce.js's own header
+//    describes as "out of this file's scope" for IT to own.
+// ===========================================================================
+
+let matchState = createInitialState();
+
+const fx = {
+  hp: { A: null, B: null },        // {from,to,changedAt} per side, for hpBar
+  credits: { A: null, B: null },   // {from,to,changedAt,delta} per side
+  latent: { A: null, B: null },    // {changedAt} per side
+  spriteFrame: { A: 'idle', B: 'idle' },
+  spriteUntil: { A: 0, B: 0 },
+  shake: null,                     // {startedAt, magnitude}
+  burst: null,                     // {startedAt, x, y, color, label}
+  cutin: null,                     // claimCutIn state shape
+  reveal: null,                    // {startedAt, cardId, attacker, defender, ask}
+  integrity: null,                 // sticky once set — CONTRACTS: "does not clear"
+  koAt: null,                      // ms timestamp the KO/duel_end overlay should show from
+};
+
+function seenClaimKey(c) {
+  return `${c.exchangeId}::${c.cls}::${c.seq}`;
+}
+
+/** Diff `prev` -> `next` MatchState and populate/update `fx` in place.
+ *  `nowMs` is the single UI clock every fx timestamp is stamped with —
+ *  performance.now(), threaded through from the poll loop so an fx entry's
+ *  `changedAt`/`startedAt` is always in the same clock the render loop's own
+ *  `t` argument uses (core/widgets.js's own contract for every widget).
+ *
+ *  `allowReveal` (default true) gates ONLY the full-screen card-flip beat.
+ *  A scrubber seek re-folds every event from byte 0 up to the target
+ *  INSTANTLY (ingestInstant, below) so the HUD reflects that instant right
+ *  away — but `exchange_start` living somewhere in that history is not
+ *  "just now", and re-arming a 5 s, near-opaque, WHOLE-CANVAS overlay every
+ *  time the viewer drags the scrubber would make seeking to anything look
+ *  like a blank/broken page for the next 5 real seconds. The other transient
+ *  beats (shake/burst/sprite-flash/cut-in) are left triggerable either way:
+ *  none of them cover the full screen, and briefly flashing the cut-in for
+ *  a claim you just scrubbed next to is closer to a caption than a bug. */
+function applyFx(prev, next, nowMs, { allowReveal = true } = {}) {
+  for (const side of ['A', 'B']) {
+    const p = prev.sides[side];
+    const n = next.sides[side];
+
+    if (p.hp !== n.hp) {
+      fx.hp[side] = { from: p.hp, to: n.hp, changedAt: nowMs };
+      if (n.hp < p.hp) {
+        fx.spriteFrame[side] = 'hurt';
+        fx.spriteUntil[side] = nowMs + 450;
+      }
+    }
+    if (p.credits !== n.credits) {
+      fx.credits[side] = { from: p.credits, to: n.credits, changedAt: nowMs, delta: n.credits - p.credits };
+    }
+    if (p.latent !== n.latent) {
+      fx.latent[side] = { changedAt: nowMs };
+    }
+
+    // Newly resolved claims (pending -> verified/false/rejected) this side
+    // filed -> drive the prosecution cut-in. `n.claims` already carries the
+    // referee's own numbers (weight/scaled/outcome) AS GIVEN — never
+    // recomputed here (reduce.js's own rule, restated for this adapter).
+    for (const c of n.claims) {
+      if (c.outcome === 'pending') continue;
+      const before = p.claims.find((pc) => seenClaimKey(pc) === seenClaimKey(c));
+      if (before && before.outcome === c.outcome) continue;
+      fx.cutin = {
+        active: true, startedAt: nowMs,
+        prosecutingTeam: n.team || side,
+        cls: c.cls, evidence: c.evidence, argument: c.argument,
+        outcome: c.outcome, weight: c.weight, scaled: c.scaled,
+      };
+    }
+
+    // New raw log lines this poll appended -> mutation/exchange_start beats.
+    const newLines = n.log.slice(p.log.length);
+    for (const entry of newLines) {
+      if (entry.type === 'mutation' && entry.p && entry.p.applied) {
+        fx.shake = { startedAt: nowMs, magnitude: TIMINGS.shakeMagnitudePx };
+        // CONTRACTS 10.2: "screen shake + the class name in the ATTACKER's
+        // colour" — `side` here is the mutation event's own envelope side,
+        // which this fixture's authoring convention (and this view's own
+        // reading of it) treats as the attacking team.
+        const slot = side === YOU ? 'left' : 'right';
+        const bx = slot === 'left' ? LAYOUT.spriteA.x + LAYOUT.spriteA.w / 2 : LAYOUT.spriteB.x + LAYOUT.spriteB.w / 2;
+        const by = LAYOUT.spriteA.y + LAYOUT.spriteA.h / 2;
+        const attackerColor = slot === 'left' ? COLORS.sideA : COLORS.sideB;
+        fx.burst = { startedAt: nowMs, x: bx, y: by, color: attackerColor, label: String(entry.p.class || 'mutation') };
+        fx.spriteFrame[side] = 'attack';
+        fx.spriteUntil[side] = nowMs + 450;
+      }
+      if (entry.type === 'integrity' && !fx.integrity) {
+        fx.integrity = { kind: entry.p.kind, detail: entry.p.detail };
+      }
+      if (entry.type === 'exchange_start' && allowReveal) {
+        fx.reveal = {
+          startedAt: nowMs, cardId: entry.p.card_id,
+          attacker: entry.p.attacker, defender: entry.p.defender,
+          ask: entry.p.ask,
+        };
+      }
+      if (entry.type === 'duel_end') {
+        fx.koAt = nowMs;
+      }
+    }
+  }
+}
+
+// ===========================================================================
+// 5. combat-log formatting — turns the raw per-side event log into the
+//    {seq, text, costLabel, denied} shape core/widgets.js's combatLog wants.
+//    Only the event types CONTRACTS 10.2's render mapping assigns "one
+//    combat-log line" to become lines here; tool_call/tool_result/decision/
+//    model_turn drive OTHER widgets (credit bar, sprite state) instead, per
+//    that same table, and are skipped here on purpose.
+// ===========================================================================
+
+function fmtMask(fields) {
+  return Array.isArray(fields) && fields.length ? `[${fields.slice().sort().join(',')}]` : '[]';
+}
+
+function mergedLog(state) {
+  const seen = new Map();
+  for (const side of ['A', 'B']) {
+    for (const entry of state.sides[side].log) seen.set(entry.seq, entry);
+  }
+  return Array.from(seen.values()).sort((a, b) => a.seq - b.seq);
+}
+
+function buildCombatLogLines(state) {
+  const lines = [];
+  let pendingCommand = null; // adjacency-only pairing with the next `enforced` (reduce.js's own note)
+  for (const entry of mergedLog(state)) {
+    const p = entry.p || {};
+    switch (entry.type) {
+      case 'command':
+        pendingCommand = entry;
+        break;
+      case 'enforced': {
+        const cmd = pendingCommand ? pendingCommand.p : null;
+        pendingCommand = null;
+        const denied = p.verdict_applied === 'deny';
+        const head = cmd ? `${cmd.kind} ${cmd.server}.${cmd.tool} ${fmtMask(cmd.fields)}` : 'command';
+        const tail = denied && p.reason ? ` DENIED: ${p.reason}` : (p.reason ? ` (${p.reason})` : '');
+        const cost = typeof p.charged === 'number' ? `-${p.charged} cr` : '';
+        lines.push({ seq: entry.seq, text: `${head}${tail}`, costLabel: cost, denied });
+        break;
+      }
+      case 'mutation':
+        lines.push({
+          seq: entry.seq,
+          text: `MUTATION ${p.class} -> ${p.target} (${p.op})${p.applied ? ' APPLIED' : ' fizzled'}`,
+          costLabel: '', denied: false,
+        });
+        break;
+      case 'integrity':
+        lines.push({ seq: entry.seq, text: `INTEGRITY ${p.kind}: ${p.detail || ''}`, costLabel: '', denied: false });
+        break;
+      case 'own_telemetry':
+        lines.push({ seq: entry.seq, text: `» ${p.name}: ${JSON.stringify(p.payload || {})}`, costLabel: '', denied: false });
+        break;
+      case 'answer':
+        lines.push({
+          seq: entry.seq,
+          text: `» answer submitted - ${Array.isArray(p.cited_anchors) ? p.cited_anchors.length : 0} citation(s)`,
+          costLabel: '', denied: false,
+        });
+        break;
+      case 'penalty':
+        lines.push({ seq: entry.seq, text: `PENALTY (${p.reason || 'unknown'})`, costLabel: `-${p.amount || 0} cr`, denied: false });
+        break;
+      case 'round_end':
+        lines.push({ seq: entry.seq, text: `-- round ${p.round} end --`, costLabel: '', denied: false });
+        break;
+      case 'duel_end':
+        lines.push({ seq: entry.seq, text: `-- DUEL END: winner ${p.winner} (${p.reason}) --`, costLabel: '', denied: false });
+        break;
+      default:
+        break; // model_turn / tool_call / tool_result / decision / recoil: not a log line
+    }
+  }
+  return lines;
+}
+
+// ===========================================================================
+// 6. layout — one fixed set of rects over the 960x540 logical canvas
+// ===========================================================================
+
+const PAD = 16;
+const HALF_W = Math.floor((LOGICAL_W - PAD * 2 - 40) / 2);
+const LEFT_X = PAD;
+const RIGHT_X = LOGICAL_W - PAD - HALF_W;
+
+// The integrity banner (drawIntegrityBanner, below) is a full-width strip
+// pinned to y:0..INTEGRITY_BAR_H and "does not clear" once it has ever
+// fired (CONTRACTS 10.2) — this space is reserved for it UNCONDITIONALLY,
+// not just while it happens to be active, so the HUD never has to reflow
+// (and the nameplate labels never sit UNDER it) the instant the first
+// integrity event of a duel arrives.
+const INTEGRITY_BAR_H = 20;
+
+const HUD_Y = INTEGRITY_BAR_H + 6;
+const HP_Y = HUD_Y + 18;
+const CREDIT_Y = HP_Y + SIZES.hpBarHeight + SIZES.creditBarGapY;
+
+const STAGE_Y = CREDIT_Y + 14;
+const STAGE_H = 210;
+const LOG_Y = STAGE_Y + STAGE_H + 4;
+const LOG_H = 120;
+// The two pipeline strips sit directly under the combat log: the log answers
+// "what happened next", the strips answer "what was asked, what did the gateway
+// do about it, and what did the referee make of it".
+const PIPE_H = 76;
+const PIPE_A_Y = LOG_Y + LOG_H + 16;  // room for the side label above the strip
+const PIPE_B_Y = PIPE_A_Y + PIPE_H + 14;  // room for the second side label
+const CUTIN_Y = PIPE_B_Y + PIPE_H + 6;
+const SCRUBBER_H = SIZES.scrubberHeight;
+// The scrubber gets its OWN row below the prosecution panel rather than
+// being carved out of the bottom of `cutin`'s own rect — claimCutIn already
+// paints a full-height panel whenever it is active, so sharing one rect
+// between the two would let a live cut-in and the replay transport overlap.
+const CUTIN_H = LOGICAL_H - CUTIN_Y - SCRUBBER_H - 8;
+const SCRUBBER_Y = CUTIN_Y + CUTIN_H + 4;
+
+const SPRITE_BOX = 112;
+const LAYOUT = {
+  hpLeft: { x: LEFT_X, y: HP_Y, w: HALF_W, h: SIZES.hpBarHeight },
+  hpRight: { x: RIGHT_X, y: HP_Y, w: HALF_W, h: SIZES.hpBarHeight },
+  creditLeft: { x: LEFT_X, y: CREDIT_Y, w: HALF_W - 60, h: SIZES.creditBarHeight },
+  creditRight: { x: RIGHT_X + 60, y: CREDIT_Y, w: HALF_W - 60, h: SIZES.creditBarHeight },
+  latentLeft: { x: LEFT_X + HALF_W - 52, y: CREDIT_Y - 4 },
+  latentRight: { x: RIGHT_X, y: CREDIT_Y - 4 },
+  roundBanner: { x: LOGICAL_W / 2 - 120, y: STAGE_Y + 6, w: 240, h: SIZES.roundBannerHeight },
+  spriteA: { x: LOGICAL_W / 2 - 180 - SPRITE_BOX, y: STAGE_Y + STAGE_H / 2 - SPRITE_BOX / 2, w: SPRITE_BOX, h: SPRITE_BOX },
+  spriteB: { x: LOGICAL_W / 2 + 180, y: STAGE_Y + STAGE_H / 2 - SPRITE_BOX / 2, w: SPRITE_BOX, h: SPRITE_BOX },
+  log: { x: PAD, y: LOG_Y, w: LOGICAL_W - PAD * 2, h: LOG_H },
+  pipelineA: { x: PAD, y: PIPE_A_Y, w: LOGICAL_W - PAD * 2, h: PIPE_H },
+  pipelineB: { x: PAD, y: PIPE_B_Y, w: LOGICAL_W - PAD * 2, h: PIPE_H },
+  cutin: { x: PAD, y: CUTIN_Y, w: LOGICAL_W - PAD * 2, h: CUTIN_H },
+  scrubber: { x: PAD, y: SCRUBBER_Y, w: LOGICAL_W - PAD * 2, h: SCRUBBER_H },
+};
+
+// ===========================================================================
+// 7. panel chrome for the bits widgets.js does not export (that file's
+//    exported widgets cover HP/credit/log/cutin/round/scrubber only —
+//    reveal, sprite frames, the integrity banner and the KO screen are this
+//    view's own local beats, drawn with the same flat-rect language).
+// ===========================================================================
+
+function drawFlatPanel(x, y, w, h, fill, border) {
+  ctx.fillStyle = fill;
+  ctx.fillRect(x, y, w, h);
+  if (border) {
+    ctx.strokeStyle = border;
+    ctx.lineWidth = SIZES.borderWidth;
+    ctx.strokeRect(x + 1, y + 1, w - 2, h - 2);
+  }
+}
+
+function drawSpritePanel(rect, sheet, side, t) {
+  drawFlatPanel(rect.x, rect.y, rect.w, rect.h, COLORS.panelBg, COLORS.panelBorder);
+  if (!sheet) return; // headless / sprites.js not yet loaded — degrade gracefully
+  let frame = fx.spriteFrame[side];
+  if (t > fx.spriteUntil[side]) frame = 'idle';
+  const canvasSprite = sheet[frame] || sheet.idle;
+  if (!canvasSprite) return;
+  const scale = 6;
+  const w = canvasSprite.width * scale;
+  const h = canvasSprite.height * scale;
+  drawSprite(ctx, canvasSprite, rect.x + (rect.w - w) / 2, rect.y + (rect.h - h) / 2, scale);
+}
+
+function drawReveal(state, t) {
+  const r = fx.reveal;
+  if (!r) return;
+  const elapsed = t - r.startedAt;
+  if (elapsed < 0 || elapsed > TIMINGS.revealMs) return;
+  const alpha = elapsed > TIMINGS.revealMs - 500 ? Math.max(0, (TIMINGS.revealMs - elapsed) / 500) : 1;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  drawFlatPanel(0, 0, LOGICAL_W, LOGICAL_H, 'rgba(10,14,22,0.92)', null);
+  if (SPRITES && SPRITES.cardback) {
+    const scale = 8;
+    const w = SPRITES.cardback.width * scale;
+    const h = SPRITES.cardback.height * scale;
+    drawSprite(ctx, SPRITES.cardback, LOGICAL_W / 2 - w / 2, LOGICAL_H / 2 - h / 2 - 40, scale);
+  }
+  const title = `ROUND ${state.round || 1} — ${(r.attacker || 'ATTACKER').toUpperCase()} ATTACKS`;
+  const tw = measurePixelText(ctx, title, 2);
+  drawPixelText(ctx, LOGICAL_W / 2 - tw / 2, LOGICAL_H / 2 + 100, title, COLORS.text, 2);
+  if (r.ask && r.ask.type) {
+    const sub = `card ${r.cardId || '?'} — ask: ${r.ask.type}`;
+    const sw = measurePixelText(ctx, sub, 1);
+    drawPixelText(ctx, LOGICAL_W / 2 - sw / 2, LOGICAL_H / 2 + 122, sub, COLORS.textDim, 1);
+  }
+  ctx.restore();
+}
+
+function drawIntegrityBanner(t) {
+  if (!fx.integrity) return;
+  const period = TIMINGS.integrityPulseMs;
+  const phase = ((t % period) / period) * Math.PI * 2;
+  const alpha = 0.55 + 0.35 * Math.sin(phase);
+  ctx.save();
+  drawFlatPanel(0, 0, LOGICAL_W, INTEGRITY_BAR_H, `rgba(255,45,85,${alpha.toFixed(3)})`, null);
+  const text = `INTEGRITY: ${fx.integrity.kind} — ${fx.integrity.detail || ''}`;
+  drawPixelText(ctx, PAD, 6, text.slice(0, 140), COLORS.text, 1);
+  ctx.restore();
+}
+
+function drawKoOverlay(state, t) {
+  if (!fx.koAt) return;
+  ctx.save();
+  drawFlatPanel(0, 0, LOGICAL_W, LOGICAL_H, 'rgba(10,14,22,0.88)', null);
+  if (SPRITES && SPRITES.skull) {
+    const scale = 9;
+    const w = SPRITES.skull.width * scale;
+    const h = SPRITES.skull.height * scale;
+    drawSprite(ctx, SPRITES.skull, LOGICAL_W / 2 - w / 2, LOGICAL_H / 2 - h / 2 - 50, scale);
+  }
+  const koText = 'K.O.';
+  const tw = measurePixelText(ctx, koText, 4);
+  drawPixelText(ctx, LOGICAL_W / 2 - tw / 2, LOGICAL_H / 2 + 60, koText, COLORS.damageRed, 4);
+  ctx.restore();
+}
+
+// ===========================================================================
+// 8. render loop
+// ===========================================================================
+
+let scrubberRects = null; // last rects scrubber() returned, for click hit-testing
+let statusText = 'connecting...';
+
+function labelFor(side) {
+  if (side === YOU) return 'YOU';
+  const team = matchState.sides[OPPONENT].team;
+  return team ? String(team).toUpperCase() : 'OPPONENT';
+}
+
+function render(nowMs) {
+  drainPlaybackQueue(nowMs);
+
+  ctx.save();
+  ctx.fillStyle = COLORS.bg;
+  ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+
+  const shakeOffset = screenShake(fx.shake, nowMs);
+  ctx.translate(shakeOffset.dx, shakeOffset.dy);
+
+  // -- HUD: HP / credits / latent, left = YOU (A-style), right = OPPONENT (B-style) --
+  hpBar(ctx, LAYOUT.hpLeft, {
+    side: 'A', hpMax: 100,
+    from: fx.hp[YOU] ? fx.hp[YOU].from : matchState.sides[YOU].hp,
+    to: matchState.sides[YOU].hp,
+    changedAt: fx.hp[YOU] ? fx.hp[YOU].changedAt : nowMs,
+  }, nowMs);
+  hpBar(ctx, LAYOUT.hpRight, {
+    side: 'B', hpMax: 100,
+    from: fx.hp[OPPONENT] ? fx.hp[OPPONENT].from : matchState.sides[OPPONENT].hp,
+    to: matchState.sides[OPPONENT].hp,
+    changedAt: fx.hp[OPPONENT] ? fx.hp[OPPONENT].changedAt : nowMs,
+  }, nowMs);
+
+  drawPixelText(ctx, LAYOUT.hpLeft.x, HUD_Y, labelFor(YOU), COLORS.sideA, 2);
+  const oppLabel = labelFor(OPPONENT);
+  const oppW = measurePixelText(ctx, oppLabel, 2);
+  drawPixelText(ctx, LAYOUT.hpRight.x + LAYOUT.hpRight.w - oppW, HUD_Y, oppLabel, COLORS.sideB, 2);
+
+  creditBar(ctx, LAYOUT.creditLeft, {
+    side: 'A', creditsMax: 100,
+    from: fx.credits[YOU] ? fx.credits[YOU].from : matchState.sides[YOU].credits,
+    to: matchState.sides[YOU].credits,
+    changedAt: fx.credits[YOU] ? fx.credits[YOU].changedAt : nowMs,
+    delta: fx.credits[YOU] ? fx.credits[YOU].delta : 0,
+  }, nowMs);
+  creditBar(ctx, LAYOUT.creditRight, {
+    side: 'B', creditsMax: 100,
+    from: fx.credits[OPPONENT] ? fx.credits[OPPONENT].from : matchState.sides[OPPONENT].credits,
+    to: matchState.sides[OPPONENT].credits,
+    changedAt: fx.credits[OPPONENT] ? fx.credits[OPPONENT].changedAt : nowMs,
+    delta: fx.credits[OPPONENT] ? fx.credits[OPPONENT].delta : 0,
+  }, nowMs);
+  const crLabelL = `cr ${matchState.sides[YOU].credits}/100`;
+  drawPixelText(ctx, LAYOUT.creditLeft.x, LAYOUT.creditLeft.y + 8, crLabelL, COLORS.textDim, 1);
+  const crLabelR = `cr ${matchState.sides[OPPONENT].credits}/100`;
+  drawPixelText(ctx, LAYOUT.creditRight.x, LAYOUT.creditRight.y + 8, crLabelR, COLORS.textDim, 1);
+
+  latentFlags(ctx, LAYOUT.latentLeft, {
+    count: matchState.sides[YOU].latent,
+    changedAt: fx.latent[YOU] ? fx.latent[YOU].changedAt : -Infinity,
+  }, nowMs);
+  latentFlags(ctx, LAYOUT.latentRight, {
+    count: matchState.sides[OPPONENT].latent,
+    changedAt: fx.latent[OPPONENT] ? fx.latent[OPPONENT].changedAt : -Infinity,
+  }, nowMs);
+
+  // -- stage: round banner + two agent sprites --
+  roundBanner(ctx, LAYOUT.roundBanner, {
+    round: matchState.round || 1, totalRounds: 10, scale: matchState.roundScale || 1,
+  }, nowMs);
+  drawSpritePanel(LAYOUT.spriteA, SPRITES ? SPRITES.agentA : null, YOU, nowMs);
+  drawSpritePanel(LAYOUT.spriteB, SPRITES ? SPRITES.agentB : null, OPPONENT, nowMs);
+  particleBurst(ctx, LAYOUT.spriteA, fx.burst, nowMs);
+
+  // -- combat log --
+  combatLog(ctx, LAYOUT.log, { lines: buildCombatLogLines(matchState) }, nowMs);
+
+  // -- the five stages of the current exchange, one strip per side --
+  drawPixelText(ctx, LAYOUT.pipelineA.x, LAYOUT.pipelineA.y - 9,
+                `${labelFor(YOU)} DEFENDS`, COLORS.sideA, 1);
+  pipelinePanel(ctx, LAYOUT.pipelineA, matchState, YOU, nowMs);
+  drawPixelText(ctx, LAYOUT.pipelineB.x, LAYOUT.pipelineB.y - 9,
+                `${labelFor(OPPONENT)} DEFENDS`, COLORS.sideB, 1);
+  pipelinePanel(ctx, LAYOUT.pipelineB, matchState, OPPONENT, nowMs);
+
+  // -- prosecution cut-in --
+  claimCutIn(ctx, LAYOUT.cutin, fx.cutin || { active: false }, nowMs);
+
+  // -- replay scrubber (replay mode only) --
+  if (activeSource instanceof ReplaySource) {
+    scrubberRects = scrubber(ctx, LAYOUT.scrubber, {
+      playing: replayPlaying, offset: cursor, total: Math.max(1, activeSource.totalBytes),
+      speed: replaySpeed,
+    }, nowMs);
+  }
+
+  ctx.restore();
+
+  drawReveal(matchState, nowMs);
+  drawIntegrityBanner(nowMs);
+  drawKoOverlay(matchState, nowMs);
+
+  if (statusText) {
+    drawPixelText(ctx, LOGICAL_W - measurePixelText(ctx, statusText, 1) - 4, LOGICAL_H - 9, statusText, COLORS.textDim, 1);
+  }
+
+  requestAnimationFrame(render);
+}
+requestAnimationFrame(render);
+
+// ===========================================================================
+// 9. scrubber input — canvas has no DOM hit-testing, so we hit-test the
+//    rects scrubber() itself returned, per that widget's own doc comment.
+// ===========================================================================
+
+canvas.addEventListener('click', (evt) => {
+  if (!scrubberRects) return;
+  const { x, y } = toLogicalXY(evt.clientX, evt.clientY);
+  const inside = (r) => r && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h;
+  if (inside(scrubberRects.playPause)) {
+    replayPlaying = !replayPlaying;
+    if (replayPlaying) resetPlaybackAnchor(performance.now());
+  } else if (inside(scrubberRects.seekTrack)) {
+    const frac = (x - scrubberRects.seekTrack.x) / Math.max(1, scrubberRects.seekTrack.w);
+    seekTo(Math.round(Math.max(0, Math.min(1, frac)) * (activeSource ? activeSource.totalBytes : 0)));
+  } else if (inside(scrubberRects.speed1)) {
+    replaySpeed = 1;
+  } else if (inside(scrubberRects.speed2)) {
+    replaySpeed = 2;
+  } else if (inside(scrubberRects.speed8)) {
+    replaySpeed = 8;
+  }
+});
+
+// ===========================================================================
+// 10. the poll/replay engine — CONTRACTS 10.1: 125 ms while events arrive,
+//     exponential backoff to 1 s when idle, immediate re-poll on a non-empty
+//     response. NOT a constant rate.
+// ===========================================================================
+
+let activeSource = null;
+let cursor = 0;
+let running = false;
+let replayPlaying = true;
+let replaySpeed = 1;
+
+// A poll response can hand back an entire finished exchange (or a live
+// burst of several events landing in one 125 ms window) in ONE array.
+// Folding all of it into MatchState synchronously would satisfy the
+// reducer's own purity contract but would throw away "full temporal
+// choreography" (FINAL-PLAN 8.2) — a claim cut-in that should hold 3 s
+// would be replaced by the NEXT one before a single frame ever painted it.
+// So arrival (enqueueForPlayback, fed by pollLoop) and application
+// (drainPlaybackQueue, called once per render frame) are separate: events
+// are paced out using their own `t` field against a wall-clock anchor, the
+// same clock origin every fx timestamp already uses.
+let playbackQueue = [];
+let playbackAnchorWallMs = null;
+let playbackAnchorEventT = null;
+let playbackCursorT = 0; // most recently folded event's `t` (or the seek target)
+
+function resetPlaybackAnchor(nowMs) {
+  playbackAnchorWallMs = nowMs;
+  playbackAnchorEventT = playbackCursorT;
+}
+
+function foldOne(ev, nowMs, opts) {
+  const prev = matchState;
+  const next = reduce(prev, ev);
+  matchState = next;
+  applyFx(prev, next, nowMs, opts);
+  if (typeof ev.t === 'number') playbackCursorT = ev.t;
+}
+
+/** Bulk, UNPACED fold — used only by seekTo's catch-up: the viewer jumped to
+ *  a byte offset and wants the state AT that point immediately, not a fast
+ *  replay of everything before it. `allowReveal: false` — see applyFx's own
+ *  doc comment for why a seek must never re-arm the full-screen card-flip. */
+function ingestInstant(events, nowMs) {
+  for (const ev of events) foldOne(ev, nowMs, { allowReveal: false });
+}
+
+/** Queue events for paced playback (see the block comment above). */
+function enqueueForPlayback(events) {
+  if (events.length === 0) return;
+  if (playbackAnchorWallMs === null) {
+    playbackAnchorWallMs = performance.now();
+    playbackAnchorEventT = typeof events[0].t === 'number' ? events[0].t : playbackCursorT;
+  }
+  playbackQueue.push(...events);
+}
+
+/** Called once per render frame: releases every queued event whose own `t`
+ *  has now "arrived" on the paced clock, in order. A speed change mid-flight
+ *  (the scrubber's 1x/2x/8x) is continuous at the instant of the change —
+ *  only its future slope differs — so it never needs its own re-anchor;
+ *  only a pause/resume or a seek does (both call resetPlaybackAnchor). */
+function drainPlaybackQueue(nowMs) {
+  if (playbackQueue.length === 0 || playbackAnchorWallMs === null) return;
+  if (activeSource instanceof ReplaySource && !replayPlaying) return; // paused
+  const speed = activeSource instanceof ReplaySource ? (replaySpeed || 1) : 1;
+  const elapsedEventSeconds = ((nowMs - playbackAnchorWallMs) / 1000) * speed;
+  const readyBoundaryT = playbackAnchorEventT + elapsedEventSeconds;
+  while (playbackQueue.length > 0 && playbackQueue[0].t <= readyBoundaryT) {
+    foldOne(playbackQueue.shift(), nowMs);
+  }
+}
+
+/** Rebuild MatchState from scratch up to `offset` — used for a scrubber seek
+ *  backward, since MatchState is a pure fold and there is no cheaper partial
+ *  un-fold (CONTRACTS 10.1: replay seeks "by byte offset", not by re-running
+ *  the live poll loop). Only meaningful for a ReplaySource, which can serve
+ *  any byte range on demand; a LiveSource only ever moves forward. Applied
+ *  INSTANTLY (ingestInstant, not the paced queue): a seek means "show me the
+ *  state at this point right now", not "fast-forward through it". */
+async function seekTo(offset) {
+  if (!(activeSource instanceof ReplaySource)) return;
+  matchState = createInitialState();
+  fx.hp.A = fx.hp.B = null;
+  fx.credits.A = fx.credits.B = null;
+  fx.latent.A = fx.latent.B = null;
+  fx.cutin = null; fx.reveal = null; fx.integrity = null; fx.koAt = null; fx.shake = null; fx.burst = null;
+  playbackQueue = [];
+  playbackCursorT = 0;
+  const res = await activeSource.poll(0, offset);
+  cursor = res.next_offset;
+  ingestInstant(res.events, performance.now());
+  resetPlaybackAnchor(performance.now());
+  // A ReplaySource usually finishes fetching (hits eof) within its very
+  // first poll, so pollLoop has normally already exited by the time a human
+  // gets around to clicking the scrubber — leaving nothing to enqueue
+  // anything AFTER the seek point for forward playback to resume from.
+  // Restart it (idempotent: it no-ops if somehow still running).
+  if (!running) pollLoop();
+}
+
+async function pollLoop() {
+  running = true;
+  let delay = 125;
+  while (running) {
+    if (activeSource instanceof ReplaySource && !replayPlaying) {
+      await sleep(150);
+      continue;
+    }
+    let res;
+    try {
+      res = await activeSource.poll(cursor, LIMIT_BYTES);
+      statusText = '';
+    } catch (err) {
+      statusText = `waiting: ${err && err.message ? err.message : err}`;
+      await sleep(1000);
+      continue;
+    }
+    cursor = res.next_offset;
+    enqueueForPlayback(res.events);
+    if (res.events.length > 0) {
+      delay = 125;
+      continue; // re-poll immediately — CONTRACTS 10.1
+    }
+    if (res.eof) {
+      statusText = 'all events fetched'; // playback may still be draining fx.* on its own pace
+      running = false;
+      break;
+    }
+    await sleep(delay);
+    delay = Math.min(1000, delay * 2); // exponential backoff, capped at 1 s
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ===========================================================================
+// 11. boot
+// ===========================================================================
+
+async function boot() {
+  if (RUN_ID && EXCHANGE_ID) {
+    activeSource = new LiveSource(RUN_ID, EXCHANGE_ID);
+    pollLoop();
+    return;
+  }
+  if (REPLAY_PATH) {
+    activeSource = new ReplaySource(REPLAY_PATH);
+    pollLoop();
+    return;
+  }
+  // No params at all: best-effort demo replay so the page is never just a
+  // blank idle HUD when opened without arguments. Silent, non-fatal if the
+  // relative fixture is not there (a real deployment need not ship it next
+  // to spar.html).
+  try {
+    const probe = new ReplaySource('tests/sample_exchange.jsonl');
+    await probe._ensureLoaded();
+    activeSource = probe;
+    statusText = 'demo replay: tests/sample_exchange.jsonl';
+    pollLoop();
+  } catch {
+    statusText = 'idle — no ?run=&exchange= or ?replay= given';
+  }
+}
+boot();
+
+// Inert unless ?debug=1: a read-only peephole into this module's own
+// closed-over state, for a human (or an automated check) driving the page
+// from outside — canvas has no DOM to inspect otherwise. Never referenced
+// by any code above; harmless to leave in the shipped artifact.
+if (params.get('debug') === '1') {
+  window.__NH_DEBUG__ = {
+    get matchState() { return matchState; },
+    get fx() { return fx; },
+    get cursor() { return cursor; },
+    get scrubberRects() { return scrubberRects; },
+    get layout() { return LAYOUT; },
+    forceRender(t) { render(typeof t === 'number' ? t : performance.now()); },
+    get playbackQueueLen() { return playbackQueue.length; },
+    get playbackAnchorWallMs() { return playbackAnchorWallMs; },
+    get playbackAnchorEventT() { return playbackAnchorEventT; },
+    get playbackCursorT() { return playbackCursorT; },
+    get replayPlaying() { return replayPlaying; },
+    get running() { return running; },
+  };
+}
+</script>
+</body>
+</html>
