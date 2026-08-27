@@ -112,13 +112,28 @@ make ui               # mở màn hình pixel · open the pixel battle view
 no world in kit/world/ - ask your instructor for the world artifact
 ```
 
-Corpus (~12 MB) do giảng viên phát riêng, không commit vào repo. Nhận được rồi,
-giải nén nguyên thư mục `<world_id>/` vào `kit/world/`:
+Corpus (~12 MB) không commit vào repo — tải từ **Releases**:
 
 ```bash
-unzip colosseum-world-<world_id>.zip -d kit/world/
-make doctor     # -> world <world_id> - N pages
+gh release download world-df8c55dabb35 --pattern '*.zip'
+unzip colosseum-world-df8c55dabb35.zip     # -> kit/world/df8c55dabb35/
+rm colosseum-world-df8c55dabb35.zip
+make doctor                                # -> world df8c55dabb35 - 12375 pages
 ```
+
+Kiểm tra toàn vẹn (khuyến khích):
+
+```bash
+gh release download world-df8c55dabb35 --pattern '*.sha256'
+shasum -a 256 -c colosseum-world-df8c55dabb35.zip.sha256
+```
+
+Dùng `gh` vì repo đang private — `curl` thẳng link release trả **404** cho tới
+khi repo mở public.
+
+*Download the corpus from the repo's Releases with `gh` (a plain `curl` to the
+release URL returns 404 while this repo is private). Verify the sha256. Unzip
+the whole directory so `kit/world/df8c55dabb35/manifest.json` exists.*
 
 Thư mục phải trông như `kit/world/<world_id>/manifest.json`. Nếu `make doctor`
 vẫn báo thiếu, bạn giải nén lồng sai một cấp.
