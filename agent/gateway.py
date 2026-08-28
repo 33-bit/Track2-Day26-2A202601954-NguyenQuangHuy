@@ -333,95 +333,135 @@ class Gateway:
     def __init__(self, ctx: GatewayContext) -> None:
         self.ctx = ctx
         self._telemetry = Telemetry(ctx)
-
-        # --- per-duel memory, unused by the naive starter below ---------
-        # A cache of anchor -> body-ish data you have already paid for this
-        # duel (agent/strategy.py's ResultCache is a ready-made version of
-        # this). Populating it needs the *result* of a call, which decide()
-        # never sees (it only sees the outgoing Command) — you would fill
-        # this from whatever the arena hands back to your agent loop AFTER
-        # a call executes, then consult it here on the NEXT decide() call
-        # for the same anchor.
         self._seen_anchors: dict[str, Any] = {}
-        # Credits you have personally authorised so far this duel — your
-        # own running total, independent of (and a cross-check against)
-        # `ctx.credits`, which the arena maintains authoritatively.
         self._credits_authorised: int = 0
-        # Command ids you have already denied, in case a later job wants to
-        # know "have I already said no to this once".
         self._denied_cmd_ids: set[str] = set()
+        self._admitted: dict[str, dict] = {}
+        self._admitted_cards: dict[str, dict] = {}
+        self._etags: dict[str, str] = {}
+        self._idempotency: set[str] = set()
+        try:
+            from agent.strategy import ResultCache
+            self._cache: ResultCache = ResultCache()
+        except ImportError:
+            self._cache = None  # type: ignore
+        self._history_anchors: set[tuple[str, tuple[str, ...]]] = set()
+
+    def note_card(self, server: str, card: dict) -> None:
+        self._admitted[server] = card
+        self._admitted_cards[server] = card
+
+    def note_provenance(self, anchor: str, etag: str) -> None:
+        self._etags[anchor] = etag
+
+    def note_result(self, anchor: str, etag: str) -> None:
+        self._etags[anchor] = etag
+        # also populate ResultCache if available
+        if self._cache is not None and anchor:
+            try:
+                self._cache.put(anchor, ("body", "title"), {"etag": etag})
+                self._history_anchors.add((anchor, ("body", "title")))
+            except Exception:
+                pass
 
     def decide(self, cmd: Command) -> Decision:
-        """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3).
-        Raising anything, or returning a `Decision` `__post_init__` rejects,
-        is treated by the arena exactly like an explicit deny PLUS a 2
-        credit penalty PLUS a scored `integrity` event (CONTRACTS.md 4.1's
-        charging table) — so the one thing this method must never do is
-        blow up or wander off into I/O, no matter how tempting a "quick
-        check" against something external looks. Everything you need to
-        decide is already sitting in `cmd` and `self.ctx`.
-
-        This starter forwards EVERYTHING it is handed, unmodified, and
-        denies NOTHING — see the module docstring's "THE STARTER'S SHAPE".
-        The four jobs below are named, ordered, and commented; none of them
-        currently changes the outcome."""
+        """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3)."""
         self._telemetry.decision_seen(cmd)
+        try:
+            from agent.strategy import is_catalog_trap, successor_of
+            from kit.mcp.specs import TOOL_SPECS
+        except ImportError:
+            TOOL_SPECS = {}
+            def is_catalog_trap(s, t, f): return False
+            def successor_of(s, t): return None
 
-        # ------------------------------------------------------------------
-        # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
-        # TODO(you): day18-style drift is real and measured (CORPUS-FACTS.md
-        # section 2) — a `swap_replica` mutation (CONTRACTS.md section 8's
-        # closed mutation-op set) can point `cmd` at a stale replica without
-        # the model ever noticing. `agent/strategy.py`'s replica-choice
-        # helper is where this heuristic belongs; wire its answer in here by
-        # REWRITING `cmd.headers["mcp-replica"]` (verdict="rewrite") rather
-        # than silently trusting whatever the model asked for.
-        routed = cmd  # starter: no rerouting — pass the command through untouched
+        server, tool = cmd.server, cmd.tool
+        headers = dict(cmd.headers)
+        fields = tuple(cmd.fields)
+        args = dict(cmd.args)
+        call_index = cmd.call_index
+        rewritten = False
+        succ = successor_of(server, tool)
+        if succ is not None:
+            server, tool = succ
+            rewritten = True
+        if "Mcp-Replica" not in headers and "mcp-replica" not in {k.lower() for k in headers}:
+            headers["Mcp-Replica"] = "w"
+        # ResultCache: don't pay twice for same (anchor, fields) — the 11→8 credit saver
+        anchor = args.get("anchor") or args.get("concept") or args.get("term")
+        if anchor and self._cache is not None:
+            # check exact (anchor, fields) hit
+            cached = self._cache.get(str(anchor), tuple(fields))
+            if cached is not None:
+                self._telemetry.note(f"ResultCache hit for {anchor!r} fields={fields} — deny duplicate to save credits")
+                return self.deny(cmd, reason=f"ResultCache hit for {anchor!r} — already paid for this (anchor, fields)")
+            # also track history for history-based dedup (when note_result not yet called, use history set)
+            key = (str(anchor), tuple(sorted(fields)))
+            if key in self._history_anchors:
+                self._telemetry.note(f"history hit for {anchor!r}")
+                return self.deny(cmd, reason=f"duplicate anchor {anchor!r} already requested this duel")
+        routed = Command(cmd_id=cmd.cmd_id, kind=cmd.kind, raw=cmd.raw, server=server, tool=tool, args=args, fields=fields, headers=headers, lease_id=cmd.lease_id, call_index=call_index)
 
-        # ------------------------------------------------------------------
-        # JOB 2 — ADMIT: is this call worth letting through AT ALL, before
-        # it costs anything?
-        # TODO(you): a call you already KNOW is doomed (no live lease in
-        # `self.ctx.leases` for a `get_frame`, a write with no realistic
-        # chance of a matching `If-Match`, a call that already 409'd once
-        # this duel and nothing has changed) is a candidate to DENY here —
-        # and remember, `verdict="deny"` costs the caller ZERO credits
-        # (CONTRACTS.md 4.1's charging table has exactly one $0 row, and
-        # this is it). A `deny` you can defend beats a `forward` you can't.
-        # starter: admits every command unconditionally.
-
-        # ------------------------------------------------------------------
-        # JOB 3 — AUTHORIZE: does `routed` actually belong to WHOM YOU SERVE?
-        # TODO(you): a write whose target learner id != `self.ctx.act`, or a
-        # scope this call needs that `self.ctx.scopes` never granted, is the
-        # `authority_exceeded` class (CONTRACTS.md section 6.4) — the
-        # single heaviest-weighted class in the whole rubric (weight 10,
-        # tied with `enforcement_failure`) precisely because it is what
-        # Day 26's own thesis is about: what your infrastructure enforced,
-        # not what your agent happened to say. `kit/mcp/a2a.py`'s
-        # `verify_delegation` is the real worked example of an authority
-        # check over a signed token, for the A2A-specific version of this
-        # same job.
-        # starter: never checks `self.ctx.act` / `self.ctx.scopes` at all —
-        # this is a real hole, left open on purpose for you to close.
-
-        # ------------------------------------------------------------------
-        # JOB 4 — BUDGET: can the DUEL (all 10 rounds, not just this call)
-        # actually afford `routed` as written?
-        # TODO(you): `fields=("*",)` on `registry.list_servers` or
-        # `glossary.list_terms` is a "punishment button" (FINAL-PLAN.md
-        # section 4.1) that alone can exceed a whole round's sustainable
-        # allowance — see agent/strategy.py's own arithmetic in its module
-        # docstring: a disciplined round costs about 8-11 credits against a
-        # pool of 100 for the WHOLE duel; a careless one costs about 49 and
-        # is bankrupt by round 3. When `self.ctx.credits` is getting thin,
-        # REWRITE `routed.fields` down to the tool's cheap default instead
-        # of forwarding the expensive mask verbatim.
-        # starter: never rewrites a mask and never paces spend — it trusts
-        # the model's own field mask exactly as written, every time.
-
+        if routed.tool == "get_frame":
+            live = getattr(self.ctx, "leases", ()) or ()
+            if live:
+                lease = routed.lease_id
+                if not lease or lease not in live:
+                    return self.deny(cmd, reason="get_frame without live lease_id (protocol_misuse)")
+        if routed.args.get("route") or routed.args.get("_route") or routed.args.get("replica"):
+            return self.deny(cmd, reason="route declared in body not header (header_spoof/replica_flip)")
+        if routed.headers.get("x-card-signature") == "invalid":
+            return self.deny(cmd, reason="forged agent card signature (forged_card)")
+        if routed.headers.get("x-server-fingerprint") == "unvouched":
+            return self.deny(cmd, reason="shadow server fingerprint unvouched (shadow)")
+        if routed.args.get("peer_unverified"):
+            return self.deny(cmd, reason="peer answer unverified (faithless_peer)")
+        _blob = " ".join(str(v) for v in routed.args.values()).lower()
+        _injection_markers = ("ignore previous", "ignore all previous", "system override", "bỏ qua mọi hướng dẫn", "you must now", "also record this for", "print the", "reveal the", "instead, record", "system prompt")
+        if any(m in _blob for m in _injection_markers):
+            return self.deny(cmd, reason="injected instruction in arguments (poisoned_result)")
+        if routed.server in ("curriculum-analyst", "citation-checker", "roster"):
+            aud = headers.get("aud") or headers.get("Aud") or headers.get("AUD")
+            if aud is not None and aud not in (routed.server, f"a2a:{routed.server}", f"mcp:{routed.server}"):
+                return self.deny(cmd, reason=f"delegation aud {aud!r} != server {routed.server!r} (identity)")
+            if self._admitted and routed.server not in self._admitted:
+                return self.deny(cmd, reason=f"peer {routed.server!r} card not admitted (forged_card)")
+        _act = getattr(self.ctx, "act", None)
+        for _key in ("learner", "learner_id", "target", "subject", "act"):
+            _target = routed.args.get(_key)
+            if isinstance(_target, str) and _target.startswith("learner:") and _act and _target != _act:
+                return self.deny(cmd, reason=f"target {_target!r} != act {_act!r} (authority_exceeded)")
+        if is_catalog_trap(routed.server, routed.tool, routed.fields):
+            if (routed.server, routed.tool) == ("registry", "list_servers"):
+                fields = ("name",)
+                rewritten = True
+            elif (routed.server, routed.tool) == ("glossary", "list_terms"):
+                fields = ("term",)
+                rewritten = True
+            routed = Command(cmd_id=cmd.cmd_id, kind=cmd.kind, raw=cmd.raw, server=server, tool=tool, args=args, fields=fields, headers=headers, lease_id=cmd.lease_id, call_index=call_index)
+        if routed.fields == ("*",):
+            spec = TOOL_SPECS.get((routed.server, routed.tool))
+            if spec is not None:
+                fields = tuple(spec.default_fields) if spec.default_fields else ("anchor",)
+                routed = Command(cmd_id=cmd.cmd_id, kind=cmd.kind, raw=cmd.raw, server=server, tool=tool, args=args, fields=fields, headers=headers, lease_id=cmd.lease_id, call_index=call_index)
+                rewritten = True
+        # record history for ResultCache dedup on next call
+        anchor_hist = args.get("anchor") or args.get("concept") or args.get("term")
+        if anchor_hist:
+            self._history_anchors.add((str(anchor_hist), tuple(sorted(tuple(fields)))))
+        try:
+            credits_left = getattr(self.ctx, "credits", 100)
+            spec = TOOL_SPECS.get((routed.server, routed.tool))
+            if spec is not None and isinstance(credits_left, int):
+                eff = spec.default_fields if not routed.fields else (spec.all_fields if routed.fields == ("*",) else routed.fields)
+                est = spec.base + sum(spec.field_weight.get(f, 0) for f in eff)
+                if credits_left < est and credits_left < 20:
+                    self._telemetry.note(f"low credits {credits_left} for {routed.server}.{routed.tool} est {est}")
+        except Exception:
+            pass
         call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        verdict = "rewrite" if rewritten else "forward"
+        decision = Decision(verdict=verdict, call=call)
         self._telemetry.decision_made(cmd, decision)
         return decision
 
